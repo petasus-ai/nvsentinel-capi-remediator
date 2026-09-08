@@ -4,7 +4,7 @@ GO ?= go
 # case vet and test are no-ops instead of failing on "no packages".
 PKGS = $(shell $(GO) list ./... 2>/dev/null)
 
-.PHONY: all fmt vet test verify verify-fmt verify-boilerplate
+.PHONY: all fmt vet test verify verify-fmt verify-mod verify-boilerplate
 
 all: verify
 
@@ -20,7 +20,10 @@ test:
 verify-fmt:
 	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "gofmt needed on:"; echo "$$out"; exit 1; fi
 
+verify-mod:
+	$(GO) mod tidy -diff
+
 verify-boilerplate:
 	hack/verify-boilerplate.sh
 
-verify: verify-fmt verify-boilerplate vet test
+verify: verify-fmt verify-mod verify-boilerplate vet test

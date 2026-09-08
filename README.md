@@ -97,7 +97,7 @@ cheaper repair that their provider cannot offer.
 ## Development
 
 ```
-make verify   # gofmt, license headers, go vet, tests
+make verify   # gofmt, go.mod tidiness, license headers, go vet, tests
 ```
 
 ## Contributing
