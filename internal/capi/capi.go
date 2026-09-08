@@ -28,7 +28,9 @@ limitations under the License.
 package capi
 
 import (
-	"k8s.io/client-go/tools/record"
+	"unicode/utf8"
+
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -46,8 +48,13 @@ const (
 
 // Event reasons recorded on Machines. Annotations die with the Machine and
 // remediation may delete it, so an Event is the only record of a fault that
-// outlives the node it happened on.
+// outlives the node it happened on. Every Event also names the action it
+// is about, which the events API keeps as a separate field.
 const (
+	// ActionRemediate is the action of Events about handing a Machine to
+	// Cluster API for remediation, whether that happened or was skipped.
+	ActionRemediate = "Remediate"
+
 	// EventMarkedForRemediation is recorded once the remediate-machine
 	// annotation is in place.
 	EventMarkedForRemediation = "MarkedForRemediation"
@@ -57,13 +64,32 @@ const (
 	EventRemediationSkipped = "RemediationSkipped"
 )
 
+// EventNoteLimit is the longest note the events API accepts, in bytes. A
+// longer note fails validation and the Event is lost.
+const EventNoteLimit = 1024
+
+// EventNote fits a note into what the events API accepts, marking the cut.
+func EventNote(note string) string {
+	if len(note) <= EventNoteLimit {
+		return note
+	}
+
+	const marker = "..."
+	cut := EventNoteLimit - len(marker)
+	for cut > 0 && !utf8.RuneStart(note[cut]) {
+		cut--
+	}
+
+	return note[:cut] + marker
+}
+
 // Actuator applies decisions to Machines in the management cluster.
 type Actuator struct {
 	// Client reaches the management cluster.
 	Client client.Client
 	// Recorder records an Event on the Machine for every action taken. It
 	// is required unless DryRun is set, which never records.
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	// DryRun evaluates the guards but writes nothing: no annotation and no
 	// Event. The results then describe what would have happened.
 	DryRun bool

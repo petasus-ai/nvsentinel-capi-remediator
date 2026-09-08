@@ -22,11 +22,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -48,7 +49,7 @@ func newScheme(t *testing.T) *runtime.Scheme {
 
 // newActuator returns an Actuator over a fake management cluster holding the
 // given Machines, plus the recorder to inspect the Events it emits.
-func newActuator(t *testing.T, machines ...*clusterv1.Machine) (*Actuator, *record.FakeRecorder) {
+func newActuator(t *testing.T, machines ...*clusterv1.Machine) (*Actuator, *events.FakeRecorder) {
 	t.Helper()
 
 	objs := make([]client.Object, 0, len(machines))
@@ -56,7 +57,7 @@ func newActuator(t *testing.T, machines ...*clusterv1.Machine) (*Actuator, *reco
 		objs = append(objs, m)
 	}
 
-	rec := record.NewFakeRecorder(8)
+	rec := events.NewFakeRecorder(8)
 	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).Build()
 
 	return &Actuator{Client: c, Recorder: rec}, rec
@@ -74,7 +75,7 @@ func stored(t *testing.T, c client.Client, m *clusterv1.Machine) *clusterv1.Mach
 	return got
 }
 
-func assertNoEvent(t *testing.T, rec *record.FakeRecorder) {
+func assertNoEvent(t *testing.T, rec *events.FakeRecorder) {
 	t.Helper()
 
 	select {
@@ -84,7 +85,7 @@ func assertNoEvent(t *testing.T, rec *record.FakeRecorder) {
 	}
 }
 
-func assertEvent(t *testing.T, rec *record.FakeRecorder, want string) {
+func assertEvent(t *testing.T, rec *events.FakeRecorder, want string) {
 	t.Helper()
 
 	select {
@@ -158,7 +159,7 @@ func TestMarkForRemediationSendsOnlyTheAnnotations(t *testing.T) {
 				return c.Patch(ctx, obj, patch, opts...)
 			},
 		}).Build()
-	a := &Actuator{Client: c, Recorder: record.NewFakeRecorder(1)}
+	a := &Actuator{Client: c, Recorder: events.NewFakeRecorder(1)}
 
 	if skip, err := a.MarkForRemediation(context.Background(), m, testReason); err != nil || skip != "" {
 		t.Fatalf("MarkForRemediation = %q, %v", skip, err)
@@ -294,6 +295,33 @@ func TestMarkForRemediationReportsPatchFailure(t *testing.T) {
 		t.Fatal("in-memory Machine was marked although the patch failed")
 	}
 	assertNoEvent(t, rec)
+}
+
+func TestEventNote(t *testing.T) {
+	short := strings.Repeat("a", EventNoteLimit)
+	if got := EventNote(short); got != short {
+		t.Fatal("a note at the limit was changed")
+	}
+
+	// The cut lands inside a multi-byte rune, which must not be split.
+	long := strings.Repeat("a", EventNoteLimit-4) + "한글"
+	got := EventNote(long)
+	if len(got) > EventNoteLimit || !strings.HasSuffix(got, "...") || !utf8.ValidString(got) {
+		t.Fatalf("EventNote() = %d bytes, valid %v, suffix %q", len(got), utf8.ValidString(got), got[len(got)-3:])
+	}
+}
+
+func TestMarkForRemediationKeepsEventNotesWithinTheLimit(t *testing.T) {
+	m := newMachine("w")
+	a, rec := newActuator(t, m)
+
+	if _, err := a.MarkForRemediation(context.Background(), m, strings.Repeat("x", 2*EventNoteLimit)); err != nil {
+		t.Fatalf("MarkForRemediation: %v", err)
+	}
+	e := <-rec.Events
+	if note := strings.TrimPrefix(e, "Warning MarkedForRemediation "); len(note) > EventNoteLimit {
+		t.Fatalf("event note is %d bytes", len(note))
+	}
 }
 
 func TestRecordSkipped(t *testing.T) {

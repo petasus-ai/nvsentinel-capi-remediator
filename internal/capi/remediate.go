@@ -58,8 +58,8 @@ func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine,
 	}
 	*m = *updated
 
-	a.Recorder.Event(m, corev1.EventTypeWarning, EventMarkedForRemediation,
-		"Marked for remediation: "+reason)
+	a.Recorder.Eventf(m, nil, corev1.EventTypeWarning, EventMarkedForRemediation, ActionRemediate,
+		"%s", EventNote("Marked for remediation: "+reason))
 
 	return "", nil
 }
@@ -77,6 +77,6 @@ func (a *Actuator) RecordSkipped(m *clusterv1.Machine, skip SkipReason, reason s
 		return
 	}
 
-	a.Recorder.Eventf(m, corev1.EventTypeWarning, EventRemediationSkipped,
-		"Remediation skipped because %s: %s", skip.Message(), reason)
+	a.Recorder.Eventf(m, nil, corev1.EventTypeWarning, EventRemediationSkipped, ActionRemediate,
+		"%s", EventNote("Remediation skipped because "+skip.Message()+": "+reason))
 }

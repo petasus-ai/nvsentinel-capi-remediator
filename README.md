@@ -12,8 +12,12 @@ contracts every infrastructure provider already implements.
 
 ## Status
 
-Nothing runs yet. This repository holds the project scaffolding: license,
-contribution rules and build targets. The design below describes what is being
+The manager runs in a management cluster and, in its default dry-run mode,
+logs the decision it would take for every NVSentinel node condition found in
+the workload clusters. With `--dry-run=false` it asks Cluster API to remediate
+the Machines whose signal maps to a replacement and records what it did as
+Events on them. Restart requests and the `ExternalRemediationRequest` source
+are not implemented yet. The design below describes the whole of what is being
 built.
 
 ## Design
@@ -83,21 +87,22 @@ cheaper repair that their provider cannot offer.
 
 ## Roadmap
 
-- Signal decoder and decision table, with tests built from real NVSentinel
-  messages.
-- Controller: workload cluster polling, Machine mapping and the annotation
-  path.
+Done: signal decoder and decision table with tests built from real
+NVSentinel messages; the controller with workload cluster polling, Machine
+mapping and the replacement path, dry-run by default.
+
+- Container image and deployment manifests.
 - Restart path through external remediation templates, with per-cluster
   concurrency limits and cleanup of the remediation request once the node
   recovers.
-- Configurable decision table.
-- gRPC sink connector receiver, replacing node condition parsing with
-  NVSentinel's lossless `HealthEvent`.
+- `ExternalRemediationRequest` source, chosen per cluster, with the
+  completion status reported back to NVSentinel.
+- Configurable decision table, Helm chart, integration tests.
 
 ## Development
 
 ```
-make verify   # gofmt, go.mod tidiness, license headers, go vet, tests
+make verify   # gofmt, go.mod tidiness, license headers, RBAC manifests, go vet, tests
 ```
 
 ## Contributing

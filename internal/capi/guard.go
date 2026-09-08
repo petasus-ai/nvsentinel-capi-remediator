@@ -23,19 +23,19 @@ import clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 type SkipReason string
 
 const (
-	// SkipDeleting: the Machine is already being deleted, so remediating it
+	// SkipDeleting the Machine is already being deleted, so remediating it
 	// would only race the deletion.
 	SkipDeleting SkipReason = "MachineDeleting"
-	// SkipAlreadyMarked: the Machine already carries the remediate-machine
+	// SkipAlreadyMarked the Machine already carries the remediate-machine
 	// annotation and Cluster API is working through it. Re-stamping it would
 	// only churn the object.
 	SkipAlreadyMarked SkipReason = "AlreadyMarkedForRemediation"
-	// SkipControlPlane: control plane Machines are never remediated by this
+	// SkipControlPlane control plane Machines are never remediated by this
 	// operator. Their remediation has a far larger blast radius and its own
 	// semantics in the control plane provider, so that decision is left to
 	// an operator.
 	SkipControlPlane SkipReason = "ControlPlaneMachine"
-	// SkipPaused: the Machine carries the paused annotation. Cluster API
+	// SkipPaused the Machine carries the paused annotation. Cluster API
 	// would hold on to the remediate-machine annotation and act at some
 	// arbitrary time after the Machine is unpaused, so the signal is left to
 	// be evaluated again then instead.
