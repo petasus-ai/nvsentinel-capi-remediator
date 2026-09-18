@@ -6,6 +6,18 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # Moves the digest pins of the base images in the Dockerfile. The golang
+  # tag follows the go directive in go.mod and is moved with it by hand, so
+  # only its digest is updated here.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "*golang"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
   - package-ecosystem: gomod
     directory: /
     schedule:

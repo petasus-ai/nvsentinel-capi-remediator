@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Everything is created in this namespace under this prefix, which lets
+# the manifests under config/ use short names such as controller-manager.
+namespace: nvsentinel-capi-remediator-system
+namePrefix: nvsentinel-capi-remediator-
+# Every object carries the application label. Selectors are left alone.
+labels:
+- pairs:
+    app.kubernetes.io/name: nvsentinel-capi-remediator
+resources:
+- ../manager
+- ../rbac

@@ -1,0 +1,9 @@
+# Only what the Dockerfile copies reaches the builder. This list mirrors
+# the COPY lines there; a path added to one must be added to the other.
+*
+!go.mod
+!go.sum
+!cmd
+!internal
+!LICENSE
+!NOTICE

@@ -89,21 +89,35 @@ cheaper repair that their provider cannot offer.
 
 Done: signal decoder and decision table with tests built from real
 NVSentinel messages; the controller with workload cluster polling, Machine
-mapping and the replacement path, dry-run by default.
+mapping and the replacement path, dry-run by default; the container image and
+kustomize deployment.
 
-- Container image and deployment manifests.
 - Restart path through external remediation templates, with per-cluster
   concurrency limits and cleanup of the remediation request once the node
   recovers.
 - `ExternalRemediationRequest` source, chosen per cluster, with the
   completion status reported back to NVSentinel.
 - Configurable decision table, Helm chart, integration tests.
+- A release workflow that publishes the image.
 
 ## Development
 
 ```
-make verify   # gofmt, go.mod tidiness, license headers, RBAC manifests, go vet, tests
+make verify                        # gofmt, go.mod tidiness, license headers, RBAC and kustomize manifests, go vet, tests
+make docker-build                  # image for the local Docker daemon, tagged IMG
+make docker-buildx IMG=<image>     # linux/amd64 and linux/arm64 image, pushed to IMG
+make deploy IMG=<image>            # render config/default with that image and apply it to the current kubectl context
+make build-installer IMG=<image>   # the same rendering, written to dist/install.yaml
+make undeploy
 ```
+
+No image is published yet, so `IMG` has to name one you pushed with
+`make docker-buildx`. The manager is deployed to the
+`nvsentinel-capi-remediator-system` namespace with `--dry-run=true`. Once its
+log shows the decisions you expect, change the argument to `--dry-run=false`
+to let it act. `make deploy` re-applies the checked-in manifests, so make that
+change in a kustomize overlay of `config/default` if it has to survive a
+redeploy.
 
 ## Contributing
 

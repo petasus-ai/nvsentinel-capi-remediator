@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: nvsentinel-capi-remediator
+    # The manager needs no privileges, host access or writable root
+    # filesystem, so the namespace enforces the restricted profile.
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: nvsentinel-capi-remediator
+spec:
+  # One replica does the work. Leader election keeps the pod a rollout
+  # starts idle until the lease the previous pod held has expired, about
+  # 15 seconds after that pod stopped renewing it.
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: nvsentinel-capi-remediator
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+        app.kubernetes.io/name: nvsentinel-capi-remediator
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+    spec:
+      serviceAccountName: controller-manager
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: manager
+        # kustomize sets the real image; see kustomization.yaml next to
+        # this file.
+        image: controller:latest
+        args:
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        # Decisions are logged and nothing is written until this is set to
+        # false. Keep it on for the first run against live clusters.
+        - --dry-run=true
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        env:
+        # Lets the Go runtime trim the heap before the memory limit is
+        # reached rather than after.
+        - name: GOMEMLIMIT
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.memory
+        resources:
+          # Memory grows with the number of workload clusters, each of
+          # which keeps a Node informer; raise the limit for a large fleet.
+          # There is no CPU limit: throttling a burst would delay every
+          # cluster's poll, and the request is what scheduling needs.
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            memory: 256Mi

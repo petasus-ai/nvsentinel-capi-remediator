@@ -35,3 +35,28 @@ jobs:
 
       - name: Verify
         run: make verify
+
+  image:
+    name: docker buildx build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A multi-platform build needs the docker-container driver; the
+      # runner's default docker driver builds for one platform only.
+      - name: Create a multi-platform builder
+        run: docker buildx create --use
+
+      - name: Build for every platform
+        run: make docker-buildx PUSH=false
+
+      # A build alone does not show that the binary runs on the distroless
+      # base. The amd64 image comes out of the cache of the step above.
+      - name: Run the amd64 image
+        run: |
+          docker buildx build --platform linux/amd64 --load -t nvsentinel-capi-remediator:ci .
+          docker run --rm nvsentinel-capi-remediator:ci --help
