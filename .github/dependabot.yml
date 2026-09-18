@@ -10,3 +10,16 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # The k8s.io modules, controller-runtime and Cluster API are released
+      # against each other, so a minor or major bump of one of them does not
+      # build on its own; they are proposed as one update. Patch releases
+      # are independent and stay separate.
+      kubernetes:
+        patterns:
+          - k8s.io/*
+          - sigs.k8s.io/controller-runtime
+          - sigs.k8s.io/cluster-api*
+        update-types:
+          - minor
+          - major
