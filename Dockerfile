@@ -1,7 +1,7 @@
 # The build stage runs on the build host's platform and cross-compiles for
 # the target platform, so a multi-platform build needs no emulation. Both
 # base images are pinned by digest; Dependabot keeps the pins current.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:3c3e25a4da13fd0478eed2df1eb35a0e667094a7124d3993a6a1d30f71c17e79 AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:6c2a5538f964f1c82f97ad14988bf05de100d922d159d0e398b54c7b0ca0c6c9 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
