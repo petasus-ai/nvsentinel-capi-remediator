@@ -17,9 +17,9 @@ logs the decision it would take for every NVSentinel node condition found in
 the workload clusters. With `--dry-run=false` it asks Cluster API to remediate
 the Machines whose signal maps to a replacement or, where the cluster's
 MachineHealthChecks remediate through a template, to a restart, and records
-what it did as Events on them. Releasing a restarted Machine once its signal
-clears and the `ExternalRemediationRequest` source are not implemented yet.
-The design below describes the whole of what is being built.
+what it did as Events on them. A Machine marked for a restart is released
+again once its signal clears. The `ExternalRemediationRequest` source is not
+implemented yet. The design below describes the whole of what is being built.
 
 ## Design
 
@@ -71,7 +71,13 @@ that every infrastructure provider already speaks:
   request itself: a MachineHealthCheck deletes the request named after every
   Machine it finds healthy, and NVSentinel's signals are not among its checks.
   Marking the Machine leaves the request, its lifecycle and the check's
-  unhealthy-count limits with Cluster API.
+  unhealthy-count limits with Cluster API. Cluster API never removes the
+  annotation, so the operator removes the ones it set for a restart once
+  NVSentinel lowers the signal, which it does after a reboot or once its
+  check passes again. Until then the Machine stays unhealthy and a provider
+  that gives up on restarting it has it replaced. A replacement called for
+  while the restart is pending turns the mark into a replacement mark, which
+  is never removed.
 
 A Machine that no MachineHealthCheck selects, or only paused ones, is not
 marked, since the annotation would do nothing, or act at some arbitrary time
@@ -98,10 +104,10 @@ Done: signal decoder and decision table with tests built from real
 NVSentinel messages; the controller with workload cluster polling, Machine
 mapping and the replacement path, dry-run by default; the container image and
 kustomize deployment; restarts through the MachineHealthChecks' remediation
-templates.
+templates, released again once the signal clears.
 
-- Releasing a restarted Machine once its signal clears, and an option to
-  escalate restarts that no template can carry out to a replacement.
+- An option to fall back to a replacement for restarts that no template can
+  carry out.
 - `ExternalRemediationRequest` source, chosen per cluster, with the
   completion status reported back to NVSentinel.
 - Configurable decision table, Helm chart, integration tests.

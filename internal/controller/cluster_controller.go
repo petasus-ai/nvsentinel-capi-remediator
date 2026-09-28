@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -108,6 +109,10 @@ type ClusterReconciler struct {
 	// so that a persisting signal is logged and recorded once rather than
 	// on every poll. It is lost on restart, which repeats each Event once.
 	seen map[client.ObjectKey]map[string]observation
+	// wouldRelease holds, per Cluster, the Machines a dry run found ready
+	// to be released, which it never releases, so that saying so happens
+	// once rather than on every poll.
+	wouldRelease map[client.ObjectKey]map[string]bool
 }
 
 // observation is the conclusion reached about one signal. It deliberately
@@ -205,6 +210,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	for _, sig := range signals {
 		current[sig.Key()] = r.handle(ctx, cluster, checks, sig, machines[sig.Node], previous[sig.Key()])
 	}
+	r.releaseRestarts(ctx, req.NamespacedName, machines, current)
 	r.remember(ctx, req.NamespacedName, previous, current)
 
 	return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
@@ -274,6 +280,23 @@ func (r *ClusterReconciler) remediate(
 		action, verb = capi.ActionRestart, "a restart"
 	}
 
+	if !restart {
+		// A replacement called for after this operator asked for a restart
+		// must outlive the restart: the mark is turned into a replacement
+		// mark, which is never released. A dry run cannot change the mark,
+		// so it may later say it would release a Machine a live run keeps.
+		escalated, err := r.actuator().Escalate(ctx, machine,
+			fmt.Sprintf("%s %s: %s", sig.Origin, describe(sig), outcome.Reason))
+		switch {
+		case err != nil:
+			log.Error(err, "escalating the restart to a replacement failed")
+			// Nothing was concluded; the next poll starts over.
+			return observation{}
+		case escalated && !r.DryRun:
+			log.Info("restart escalated to a replacement")
+		}
+	}
+
 	if skip := capi.Guard(machine); skip != "" {
 		obs.Skip = skip
 		// The actuator drops Events for skips that mean remediation is
@@ -329,6 +352,68 @@ func (r *ClusterReconciler) remediate(
 	log.Info("Machine marked for remediation", "asking", verb)
 
 	return obs
+}
+
+// releaseRestarts releases every Machine this operator marked for a
+// restart once no signal of its node calls for a restart or a replacement
+// any more. NVSentinel lowers a condition when its check passes again:
+// monitors reading the kernel log clear their conditions once they see a
+// new boot, and GPU checks on their first passing run. After a restart
+// that is the sign the restart worked; a condition lowered before the
+// restart happened means the fault is gone, and releasing then cancels a
+// restart nobody needs. Until the mark is removed Cluster API keeps the
+// Machine unhealthy, so the provider retries and the Machine is
+// eventually replaced. Machines marked for a replacement stay marked
+// until Cluster API replaces them.
+//
+// It runs only after the signals were collected successfully, so a
+// workload cluster that cannot be read never releases anything. A node
+// that disappears from the workload cluster takes its signals with it and
+// its Machine is released; the MachineHealthChecks treat a missing node as
+// unhealthy on their own. Only Machines with a node are considered, which
+// every Machine this operator marks has, since it marks them through their
+// node.
+func (r *ClusterReconciler) releaseRestarts(ctx context.Context, key client.ObjectKey, machines map[string]*clusterv1.Machine, current map[string]observation) {
+	held := map[string]bool{}
+	for _, obs := range current {
+		if obs.Machine != "" && (obs.Decision == decision.Replace || obs.Decision == decision.Restart) {
+			held[obs.Machine] = true
+		}
+	}
+
+	wouldRelease := map[string]bool{}
+	defer r.rememberWouldRelease(key, wouldRelease)
+
+	nodes := make([]string, 0, len(machines))
+	for node := range machines {
+		nodes = append(nodes, node)
+	}
+	slices.Sort(nodes)
+
+	for _, node := range nodes {
+		m := machines[node]
+		if action, ok := capi.MarkedAction(m); !ok || action != capi.ActionRestart || held[m.Name] {
+			continue
+		}
+
+		log := ctrl.LoggerFrom(ctx).WithValues("node", node, "machine", m.Name, "dryRun", r.DryRun)
+		released, err := r.actuator().Release(ctx, m,
+			fmt.Sprintf("no signal on node %s calls for a restart or a replacement any more", node))
+		switch {
+		case err != nil:
+			// The next poll tries again.
+			log.Error(err, "releasing Machine from remediation failed")
+		case released && r.DryRun:
+			wouldRelease[m.Name] = true
+			if r.releasableBefore(key, m.Name) {
+				log.V(1).Info("would still release Machine from remediation")
+			} else {
+				log.Info("would release Machine from remediation, its restart signal cleared")
+			}
+		case released:
+			log.Info("Machine released from remediation, its restart signal cleared")
+		}
+	}
 }
 
 // report logs a conclusion that involves no action and, when it is news and
@@ -446,6 +531,32 @@ func (r *ClusterReconciler) forget(key client.ObjectKey) {
 	defer r.mu.Unlock()
 
 	delete(r.seen, key)
+	delete(r.wouldRelease, key)
+}
+
+// releasableBefore reports whether the last poll of the Cluster already
+// found the Machine ready to be released in a dry run.
+func (r *ClusterReconciler) releasableBefore(key client.ObjectKey, machine string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.wouldRelease[key][machine]
+}
+
+// rememberWouldRelease stores the Machines a dry run found ready to be
+// released in this poll of the Cluster.
+func (r *ClusterReconciler) rememberWouldRelease(key client.ObjectKey, machines map[string]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.wouldRelease == nil {
+		r.wouldRelease = map[client.ObjectKey]map[string]bool{}
+	}
+	if len(machines) == 0 {
+		delete(r.wouldRelease, key)
+		return
+	}
+	r.wouldRelease[key] = machines
 }
 
 // SetupWithManager registers the controller. It reconciles on Cluster

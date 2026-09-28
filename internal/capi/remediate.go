@@ -52,6 +52,7 @@ func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine,
 	}
 	updated.Annotations[clusterv1.RemediateMachineAnnotation] = ""
 	updated.Annotations[RemediationReasonAnnotation] = reason
+	updated.Annotations[RemediationActionAnnotation] = action
 
 	if err := a.Client.Patch(ctx, updated, client.MergeFrom(m)); err != nil {
 		return "", fmt.Errorf("patch machine %s/%s: %w", m.Namespace, m.Name, err)

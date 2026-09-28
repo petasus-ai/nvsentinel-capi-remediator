@@ -119,6 +119,9 @@ func TestMarkForRemediationStampsAnnotationsAndRecordsEvent(t *testing.T) {
 		if v := got.Annotations[RemediationReasonAnnotation]; v != testReason {
 			t.Errorf("%s: reason annotation = %q, want %q", name, v, testReason)
 		}
+		if v := got.Annotations[RemediationActionAnnotation]; v != ActionRemediate {
+			t.Errorf("%s: action annotation = %q, want %q", name, v, ActionRemediate)
+		}
 		// A merge patch must leave unrelated annotations in place.
 		if v := got.Annotations["keep"]; v != "me" {
 			t.Errorf("%s: existing annotation lost: %q", name, v)
@@ -169,10 +172,11 @@ func TestMarkForRemediationSendsOnlyTheAnnotations(t *testing.T) {
 		t.Fatalf("patch type = %q, want %q", gotType, types.MergePatchType)
 	}
 	// Labels and spec are set on the Machine but must never travel in the
-	// patch; only the two annotations do.
+	// patch; only the three annotations do.
 	want := map[string]any{"metadata": map[string]any{"annotations": map[string]any{
 		clusterv1.RemediateMachineAnnotation: "",
 		RemediationReasonAnnotation:          testReason,
+		RemediationActionAnnotation:          ActionRemediate,
 	}}}
 	var got map[string]any
 	if err := json.Unmarshal(gotBody, &got); err != nil {

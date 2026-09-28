@@ -709,6 +709,239 @@ func TestReconcileSkipsMachinesOptedOutOfRemediation(t *testing.T) {
 	assertEvents(t, f.events())
 }
 
+// markedFor marks the Machine the way the actuator does.
+func markedFor(action string) func(*clusterv1.Machine) {
+	return func(m *clusterv1.Machine) {
+		m.Annotations = map[string]string{
+			clusterv1.RemediateMachineAnnotation: "",
+			capi.RemediationReasonAnnotation:     "earlier signal",
+			capi.RemediationActionAnnotation:     action,
+		}
+	}
+}
+
+func lower(t *testing.T, f *fixture, node *corev1.Node) {
+	t.Helper()
+
+	node.Status.Conditions[0].Status = corev1.ConditionFalse
+	if err := f.workload.Status().Update(context.Background(), node); err != nil {
+		t.Fatalf("update node: %v", err)
+	}
+}
+
+func TestReconcileReleasesARestartOnceTheSignalClears(t *testing.T) {
+	node := newNode("gpu-w-1", raised("GpuXidError", restartMessage))
+	f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, node)
+
+	assertPoll(t, f.reconcile(t))
+	if action, ok := capi.MarkedAction(f.machine(t, "gpu-w-1")); !ok || action != capi.ActionRestart {
+		t.Fatalf("MarkedAction = %q, %v; want the Machine marked for a restart", action, ok)
+	}
+	assertEvents(t, f.events(), "Warning MarkedForRemediation")
+
+	// The restart worked and NVSentinel's check passes again.
+	lower(t, f, node)
+	assertPoll(t, f.reconcile(t))
+	m := f.machine(t, "gpu-w-1")
+	if capi.IsMarkedForRemediation(m) {
+		t.Fatal("Machine still marked after its restart signal cleared")
+	}
+	if _, ok := m.Annotations[capi.RemediationActionAnnotation]; ok {
+		t.Fatal("action annotation left behind")
+	}
+	assertEvents(t, f.events(),
+		"Normal RemediationReleased Released from remediation: no signal on node gpu-w-1 calls for a restart or a replacement any more")
+
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events())
+}
+
+func TestReconcileReleasesOnlyItsOwnRestarts(t *testing.T) {
+	// No node reports anything, so any Machine this operator marked for a
+	// restart would be released.
+	f := newFixture(t, fixtureOptions{},
+		[]client.Object{newCluster(),
+			newMachine("replace", "replace", markedFor(capi.ActionRemediate)),
+			newMachine("someone-else", "someone-else", func(m *clusterv1.Machine) {
+				m.Annotations = map[string]string{clusterv1.RemediateMachineAnnotation: ""}
+			}),
+			newMachine("restart", "restart", markedFor(capi.ActionRestart)),
+		},
+		newNode("replace"), newNode("someone-else"), newNode("restart"))
+
+	assertPoll(t, f.reconcile(t))
+	for _, name := range []string{"replace", "someone-else"} {
+		if !capi.IsMarkedForRemediation(f.machine(t, name)) {
+			t.Fatalf("%s was released", name)
+		}
+	}
+	if capi.IsMarkedForRemediation(f.machine(t, "restart")) {
+		t.Fatal("this operator's restart was not released")
+	}
+	assertEvents(t, f.events(), "Normal RemediationReleased")
+}
+
+func TestReconcileKeepsARestartWhileASignalCallsForRemediation(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		release bool
+	}{
+		{"restart", restartMessage, false},
+		// An escalation keeps the Machine marked for Cluster API to replace.
+		{"escalated to a replacement", replaceMessage, false},
+		// A signal that is only reported does not hold the Machine.
+		{"report only", reportMessage, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+				[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart))},
+				newNode("gpu-w-1", raised("GpuXidError", tt.message)))
+
+			assertPoll(t, f.reconcile(t))
+			if released := !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")); released != tt.release {
+				t.Fatalf("released = %v, want %v", released, tt.release)
+			}
+		})
+	}
+}
+
+func TestReconcileNeverReleasesARestartEscalatedToAReplacement(t *testing.T) {
+	node := newNode("gpu-w-1", raised("GpuXidError", replaceMessage))
+	f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart))}, node)
+
+	assertPoll(t, f.reconcile(t))
+	if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRemediate {
+		t.Fatalf("MarkedAction = %q, want the restart escalated to %q", action, capi.ActionRemediate)
+	}
+	assertEvents(t, f.events(), "Warning MarkedForRemediation Restart escalated to a replacement: NodeCondition GpuXidError")
+
+	// The provider's restart lowers the signal; the replacement still stands.
+	lower(t, f, node)
+	assertPoll(t, f.reconcile(t))
+	if !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("escalated Machine was released")
+	}
+	assertEvents(t, f.events())
+}
+
+func TestReconcileRetriesAFailedEscalation(t *testing.T) {
+	failing := true
+	f := newFixture(t, fixtureOptions{hubFuncs: interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if failing {
+				return errors.New("webhook denied the patch")
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart))},
+		newNode("gpu-w-1", raised("GpuXidError", replaceMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRestart {
+		t.Fatalf("MarkedAction = %q after a failed escalation", action)
+	}
+	if obs, _ := f.observed("gpu-w-1/GpuXidError"); obs != (observation{}) {
+		t.Fatalf("observation after a failed escalation = %+v, want none", obs)
+	}
+	assertEvents(t, f.events())
+
+	failing = false
+	assertPoll(t, f.reconcile(t))
+	if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRemediate {
+		t.Fatalf("MarkedAction = %q, want the escalation retried", action)
+	}
+	assertEvents(t, f.events(), "Warning MarkedForRemediation Restart escalated to a replacement")
+}
+
+func TestReconcileReleasesNothingWhenSignalsCannotBeRead(t *testing.T) {
+	f := newFixture(t, fixtureOptions{workloadFuncs: interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("apiserver unreachable")
+		},
+	}}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart))})
+
+	assertPoll(t, f.reconcile(t))
+	if !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine released although its node could not be read")
+	}
+	assertEvents(t, f.events())
+}
+
+func TestReconcileDryRunReleasesNothing(t *testing.T) {
+	f := newFixture(t, fixtureOptions{dryRun: true},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart))},
+		newNode("gpu-w-1"))
+
+	for range 2 {
+		assertPoll(t, f.reconcile(t))
+		if !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+			t.Fatal("dry run released the Machine")
+		}
+		assertEvents(t, f.events())
+		// Remembered, so the second poll does not say it again.
+		if !f.r.releasableBefore(clusterKey, "gpu-w-1") {
+			t.Fatal("dry run did not remember the Machine it would release")
+		}
+	}
+
+	// The Cluster goes away: nothing is remembered about it any more.
+	f.r.forget(clusterKey)
+	if f.r.releasableBefore(clusterKey, "gpu-w-1") {
+		t.Fatal("forgotten Cluster still remembered")
+	}
+}
+
+func TestReconcileDryRunForgetsMachinesNoLongerReleasable(t *testing.T) {
+	node := newNode("gpu-w-1")
+	f := newFixture(t, fixtureOptions{dryRun: true},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart))}, node)
+
+	assertPoll(t, f.reconcile(t))
+	if !f.r.releasableBefore(clusterKey, "gpu-w-1") {
+		t.Fatal("Machine not remembered")
+	}
+
+	// The signal returns and holds the Machine; a later clear is news again.
+	node.Status.Conditions = []corev1.NodeCondition{raised("GpuXidError", restartMessage)}
+	if err := f.workload.Status().Update(context.Background(), node); err != nil {
+		t.Fatalf("update node: %v", err)
+	}
+	assertPoll(t, f.reconcile(t))
+	if f.r.releasableBefore(clusterKey, "gpu-w-1") {
+		t.Fatal("held Machine still remembered as releasable")
+	}
+}
+
+func TestReconcileRetriesAFailedRelease(t *testing.T) {
+	failing := true
+	f := newFixture(t, fixtureOptions{hubFuncs: interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if failing {
+				return errors.New("webhook denied the patch")
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart))},
+		newNode("gpu-w-1"))
+
+	assertPoll(t, f.reconcile(t))
+	if !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine released despite the failed patch")
+	}
+	assertEvents(t, f.events())
+
+	failing = false
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine not released on the next poll")
+	}
+	assertEvents(t, f.events(), "Normal RemediationReleased")
+}
+
 // failingCache is a ClusterCache whose reader fails for a reason other than
 // a missing connection.
 type failingCache struct {

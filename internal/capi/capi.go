@@ -45,6 +45,12 @@ const (
 	// is presence-only, so without this an operator reading the Machine could
 	// not tell a GPU fault from any other trigger.
 	RemediationReasonAnnotation = AnnotationPrefix + "/remediation-reason"
+
+	// RemediationActionAnnotation records the action this operator asked
+	// for when it marked a Machine, Remediate or Restart. It is the proof
+	// that the remediate-machine annotation is this operator's to remove:
+	// a Machine marked for a restart is released once its signal clears.
+	RemediationActionAnnotation = AnnotationPrefix + "/remediation-action"
 )
 
 // Event reasons recorded on Machines. Annotations die with the Machine and
@@ -66,6 +72,9 @@ const (
 	// remediation but a guard left the Machine untouched and nothing else
 	// is going to act on it.
 	EventRemediationSkipped = "RemediationSkipped"
+	// EventRemediationReleased is recorded once the annotations this
+	// operator set are removed again.
+	EventRemediationReleased = "RemediationReleased"
 )
 
 // EventNoteLimit is the longest note the events API accepts, in bytes. A
