@@ -37,7 +37,7 @@ import (
 // Cluster API's own event for this names the MachineHealthCheck that acted,
 // not the fault, and the annotations disappear with the Machine moments
 // later. The Event recorded here is what an operator still has afterwards.
-func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine, reason string) (SkipReason, error) {
+func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine, action, reason string) (SkipReason, error) {
 	if skip := Guard(m); skip != "" {
 		return skip, nil
 	}
@@ -58,7 +58,7 @@ func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine,
 	}
 	*m = *updated
 
-	a.Recorder.Eventf(m, nil, corev1.EventTypeWarning, EventMarkedForRemediation, ActionRemediate,
+	a.Recorder.Eventf(m, nil, corev1.EventTypeWarning, EventMarkedForRemediation, action,
 		"%s", EventNote("Marked for remediation: "+reason))
 
 	return "", nil
@@ -72,11 +72,11 @@ func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine,
 // is recorded in dry run either. Call it once per Machine and signal:
 // repeating it on every poll while the signal persists is the caller's to
 // avoid.
-func (a *Actuator) RecordSkipped(m *clusterv1.Machine, skip SkipReason, reason string) {
+func (a *Actuator) RecordSkipped(m *clusterv1.Machine, skip SkipReason, action, reason string) {
 	if a.DryRun || skip == "" || skip.InProgress() {
 		return
 	}
 
-	a.Recorder.Eventf(m, nil, corev1.EventTypeWarning, EventRemediationSkipped, ActionRemediate,
+	a.Recorder.Eventf(m, nil, corev1.EventTypeWarning, EventRemediationSkipped, action,
 		"%s", EventNote("Remediation skipped because "+skip.Message()+": "+reason))
 }

@@ -63,14 +63,18 @@ const (
 	// ActionReport is the action of Events about signals that are reported
 	// and not acted on.
 	ActionReport = "Report"
-	// ActionRestart is the action of Events about restart requests.
-	ActionRestart = "Restart"
 
 	// EventNodeHealthReported is recorded on the Machine when a signal is
 	// reported and nothing is done about it.
 	EventNodeHealthReported = "NodeHealthReported"
+	// EventReplaceUnavailable is recorded on the Machine when a signal calls
+	// for a replacement but no MachineHealthCheck selects the Machine, or
+	// only paused ones, so marking it would do nothing for now.
+	EventReplaceUnavailable = "ReplaceUnavailable"
 	// EventRestartUnavailable is recorded on the Machine when a signal
-	// calls for a restart, which this controller cannot request yet.
+	// calls for a restart but not every MachineHealthCheck selecting the
+	// Machine remediates through a template, so marking it would replace
+	// the Machine or do nothing.
 	EventRestartUnavailable = "RestartUnavailable"
 	// EventMachineNotFound is recorded on the Cluster when a node with a
 	// signal has no Machine, so there is nothing to act on.
@@ -118,10 +122,15 @@ type observation struct {
 	Machine string
 	// Skip is why a remediation was not carried out, if it was not.
 	Skip capi.SkipReason
+	// Coverage describes the MachineHealthChecks selecting the Machine,
+	// when the decision called for them. A change in them changes what
+	// marking the Machine does.
+	Coverage string
 }
 
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machinehealthchecks,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
@@ -184,10 +193,17 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	var checks []clusterv1.MachineHealthCheck
+	if len(signals) > 0 {
+		if checks, err = capi.ListHealthChecks(ctx, r.Client, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	previous := r.observations(req.NamespacedName)
 	current := make(map[string]observation, len(signals))
 	for _, sig := range signals {
-		current[sig.Key()] = r.handle(ctx, cluster, sig, machines[sig.Node], previous[sig.Key()])
+		current[sig.Key()] = r.handle(ctx, cluster, checks, sig, machines[sig.Node], previous[sig.Key()])
 	}
 	r.remember(ctx, req.NamespacedName, previous, current)
 
@@ -199,7 +215,8 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 // logged at the default level and recorded as an Event, so a fault that
 // persists across polls does not repeat itself.
 func (r *ClusterReconciler) handle(
-	ctx context.Context, cluster *clusterv1.Cluster, sig signal.Signal, machine *clusterv1.Machine, previous observation,
+	ctx context.Context, cluster *clusterv1.Cluster, checks []clusterv1.MachineHealthCheck,
+	sig signal.Signal, machine *clusterv1.Machine, previous observation,
 ) observation {
 	outcome := r.Table.Decide(sig)
 	obs := observation{Decision: outcome.Decision, Action: outcome.Action, Truncated: sig.Truncated}
@@ -227,46 +244,89 @@ func (r *ClusterReconciler) handle(
 		log = log.WithValues("truncated", true)
 	}
 
-	reason := fmt.Sprintf("%s %s: %s", sig.Origin, describe(sig), outcome.Reason)
-
 	switch {
 	case machine == nil:
 		r.report(log, obs != previous, cluster, EventMachineNotFound, ActionReport,
 			fmt.Sprintf("node %s reports %s but no Machine owns it", sig.Node, describe(sig)))
-	case outcome.Decision == decision.Replace:
-		skip, err := r.actuator().MarkForRemediation(ctx, machine, reason)
-		if err != nil {
-			log.Error(err, "marking Machine for remediation failed")
-			// Nothing was concluded; the next poll starts over.
-			return observation{}
-		}
-		obs.Skip = skip
-
-		switch {
-		case skip != "":
-			// The actuator drops Events for skips that mean remediation is
-			// under way, so recording news here cannot spam.
-			if obs != previous {
-				log.Info("remediation skipped", "skip", skip, "why", skip.Message())
-				r.actuator().RecordSkipped(machine, skip, reason)
-			} else {
-				log.V(1).Info("remediation still skipped", "skip", skip)
-			}
-		case r.DryRun:
-			r.report(log, obs != previous, nil, "", "", "would mark Machine for remediation")
-		default:
-			// The actuator recorded the Event; the annotation guards make
-			// this happen once.
-			log.Info("Machine marked for remediation")
-		}
-	case outcome.Decision == decision.Restart:
-		r.report(log, obs != previous, machine, EventRestartUnavailable, ActionRestart,
-			fmt.Sprintf("%s calls for a restart of node %s, which is not available yet; reported only",
-				describe(sig), sig.Node))
+	case outcome.Decision == decision.Replace, outcome.Decision == decision.Restart:
+		return r.remediate(ctx, log, checks, sig, outcome, machine, obs, previous)
 	default:
 		r.report(log, obs != previous, machine, EventNodeHealthReported, ActionReport,
 			fmt.Sprintf("%s on node %s: %s", describe(sig), sig.Node, outcome.Reason))
 	}
+
+	return obs
+}
+
+// remediate hands the Machine to Cluster API when the MachineHealthChecks
+// selecting it will do what the decision asks: any remediation at all for
+// a Replace, and only remediation templates for a Restart, since a check
+// without a template would replace the Machine instead. Otherwise the
+// signal is reported. Guards come first, so that a Machine already being
+// remediated reads as in progress rather than unavailable.
+func (r *ClusterReconciler) remediate(
+	ctx context.Context, log logr.Logger, checks []clusterv1.MachineHealthCheck,
+	sig signal.Signal, outcome decision.Outcome, machine *clusterv1.Machine, obs, previous observation,
+) observation {
+	restart := outcome.Decision == decision.Restart
+	action, verb := capi.ActionRemediate, "a replacement"
+	if restart {
+		action, verb = capi.ActionRestart, "a restart"
+	}
+
+	if skip := capi.Guard(machine); skip != "" {
+		obs.Skip = skip
+		// The actuator drops Events for skips that mean remediation is
+		// under way, so recording news here cannot spam.
+		if obs != previous {
+			log.Info("remediation skipped", "skip", skip, "why", skip.Message())
+			r.actuator().RecordSkipped(machine, skip, action, fmt.Sprintf("%s %s: %s", sig.Origin, describe(sig), outcome.Reason))
+		} else {
+			log.V(1).Info("remediation still skipped", "skip", skip)
+		}
+
+		return obs
+	}
+
+	cov := capi.CoverageOf(checks, machine)
+	obs.Coverage = cov.Describe()
+	log = log.WithValues("coverage", obs.Coverage)
+
+	switch {
+	case restart && !cov.TemplatesOnly():
+		r.report(log, obs != previous, machine, EventRestartUnavailable, capi.ActionRestart,
+			fmt.Sprintf("%s calls for a restart of node %s, but %s; reported only",
+				describe(sig), sig.Node, obs.Coverage))
+		return obs
+	case !restart && !cov.Covered():
+		r.report(log, obs != previous, machine, EventReplaceUnavailable, capi.ActionRemediate,
+			fmt.Sprintf("%s calls for a replacement of node %s, but %s; reported only",
+				describe(sig), sig.Node, obs.Coverage))
+		return obs
+	}
+
+	// A Replace on a Machine whose checks all remediate through templates
+	// gets the provider's remediation first and a replacement only once
+	// that gives up; with any check remediating by replacement it is
+	// replaced at once. The reason names the checks, since they decide.
+	reason := fmt.Sprintf("%s %s: %s; %s", sig.Origin, describe(sig), outcome.Reason, obs.Coverage)
+
+	if r.DryRun {
+		r.report(log, obs != previous, nil, "", "", "would mark Machine for remediation, asking for "+verb)
+		return obs
+	}
+
+	// The actuator runs the same guards on the same object, so it cannot
+	// skip what passed them above.
+	if _, err := r.actuator().MarkForRemediation(ctx, machine, action, reason); err != nil {
+		log.Error(err, "marking Machine for remediation failed")
+		// Nothing was concluded; the next poll starts over.
+		return observation{}
+	}
+
+	// The actuator recorded the Event; the annotation guards make this
+	// happen once.
+	log.Info("Machine marked for remediation", "asking", verb)
 
 	return obs
 }

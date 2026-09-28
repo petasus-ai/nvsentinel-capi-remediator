@@ -40,6 +40,11 @@ const (
 	// arbitrary time after the Machine is unpaused, so the signal is left to
 	// be evaluated again then instead.
 	SkipPaused SkipReason = "MachinePaused"
+	// SkipOptedOut the Machine carries Cluster API's skip-remediation
+	// annotation. MachineHealthChecks leave such a Machine alone, so the
+	// remediate-machine annotation would do nothing until someone removes
+	// the opt-out and then act at an arbitrary time.
+	SkipOptedOut SkipReason = "MachineOptedOutOfRemediation"
 )
 
 // Message explains the reason in a clause, for logs and Events.
@@ -53,6 +58,8 @@ func (s SkipReason) Message() string {
 		return "the Machine is a control plane member"
 	case SkipPaused:
 		return "the Machine is paused"
+	case SkipOptedOut:
+		return "the Machine has opted out of remediation"
 	default:
 		return string(s)
 	}
@@ -80,6 +87,8 @@ func Guard(m *clusterv1.Machine) SkipReason {
 		return SkipControlPlane
 	case IsPaused(m):
 		return SkipPaused
+	case IsOptedOut(m):
+		return SkipOptedOut
 	default:
 		return ""
 	}
@@ -104,5 +113,12 @@ func IsMarkedForRemediation(m *clusterv1.Machine) bool {
 // makes Cluster API defer any remediation of it.
 func IsPaused(m *clusterv1.Machine) bool {
 	_, ok := m.Annotations[clusterv1.PausedAnnotation]
+	return ok
+}
+
+// IsOptedOut reports whether the Machine carries the skip-remediation
+// annotation, which makes MachineHealthChecks never remediate it.
+func IsOptedOut(m *clusterv1.Machine) bool {
+	_, ok := m.Annotations[clusterv1.MachineSkipRemediationAnnotation]
 	return ok
 }

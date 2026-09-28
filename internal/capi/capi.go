@@ -23,8 +23,9 @@ limitations under the License.
 // its configured remediation. Without a remediation template that is
 // replacement by the owning MachineSet; with one it is whatever the
 // provider's template does. A Machine that no MachineHealthCheck covers is
-// not acted on at all. Resolving which MachineHealthCheck covers a Machine,
-// and so what the annotation will do, is the caller's job.
+// not acted on at all. CoverageOf resolves which MachineHealthChecks cover a
+// Machine, and so what the annotation will do; choosing whether to mark it
+// on that basis is the caller's job.
 package capi
 
 import (
@@ -54,6 +55,9 @@ const (
 	// ActionRemediate is the action of Events about handing a Machine to
 	// Cluster API for remediation, whether that happened or was skipped.
 	ActionRemediate = "Remediate"
+	// ActionRestart is the action of Events about handing a Machine to
+	// Cluster API for a restart through a remediation template.
+	ActionRestart = "Restart"
 
 	// EventMarkedForRemediation is recorded once the remediate-machine
 	// annotation is in place.

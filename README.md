@@ -15,10 +15,11 @@ contracts every infrastructure provider already implements.
 The manager runs in a management cluster and, in its default dry-run mode,
 logs the decision it would take for every NVSentinel node condition found in
 the workload clusters. With `--dry-run=false` it asks Cluster API to remediate
-the Machines whose signal maps to a replacement and records what it did as
-Events on them. Restart requests and the `ExternalRemediationRequest` source
-are not implemented yet. The design below describes the whole of what is being
-built.
+the Machines whose signal maps to a replacement or, where the cluster's
+MachineHealthChecks remediate through a template, to a restart, and records
+what it did as Events on them. Releasing a restarted Machine once its signal
+clears and the `ExternalRemediationRequest` source are not implemented yet.
+The design below describes the whole of what is being built.
 
 ## Design
 
@@ -50,8 +51,8 @@ built.
 
 | NVSentinel recommended action | Decision | Cluster API action |
 |---|---|---|
-| `REPLACE_VM` | Replace | Set the `cluster.x-k8s.io/remediate-machine` annotation on the Machine. MachineHealthCheck honours it regardless of its configured checks and the owning MachineSet replaces the Machine. |
-| `RESTART_VM`, `RESTART_BM` | Restart | Clone the cluster's external remediation template (`MachineHealthCheck.spec.remediation.templateRef`) with an owner reference to the Machine, exactly as MachineHealthCheck does. The infrastructure provider's remediation controller performs the restart. |
+| `REPLACE_VM` | Replace | Set the `cluster.x-k8s.io/remediate-machine` annotation on the Machine. Every MachineHealthCheck selecting it honours the annotation regardless of its configured checks and applies its remediation: the owning MachineSet replaces the Machine, or, where the check has a remediation template, the provider's remediation runs first. |
+| `RESTART_VM`, `RESTART_BM` | Restart | The same annotation, set only when every MachineHealthCheck selecting the Machine remediates through a template (`spec.remediation.templateRef`). The check creates the request from its template and the infrastructure provider's remediation controller performs the restart. |
 | `CONTACT_SUPPORT`, `COMPONENT_RESET`, `RUN_FIELDDIAG`, `NONE`, … | Report | Log and emit an Event. These never delete a node: DCGM reports a false IMEX failure on topologies without a multi-node NVLink domain (NVIDIA/NVSentinel#1471), and honouring the recommended action is what keeps that from costing a node. |
 
 NVSentinel's `_VM` and `_BM` suffixes are lifecycle verbs rather than a
@@ -65,23 +66,29 @@ that every infrastructure provider already speaks:
 
 - The `remediate-machine` annotation is consumed by Cluster API's own
   MachineHealthCheck and MachineSet controllers.
-- The external remediation template contract is what MachineHealthCheck uses
-  for `templateRef`. A provider's remediation controller resolves a request
-  through its owner reference to the Machine, so a request created outside
-  MachineHealthCheck is handled the same way as one MachineHealthCheck created.
+- A restart is the external remediation template contract that
+  MachineHealthCheck uses for `templateRef`. The operator never creates the
+  request itself: a MachineHealthCheck deletes the request named after every
+  Machine it finds healthy, and NVSentinel's signals are not among its checks.
+  Marking the Machine leaves the request, its lifecycle and the check's
+  unhealthy-count limits with Cluster API.
 
-When a cluster has no remediation template, a restart signal falls back to
-one of two configurable behaviours: report it with an Event (the default), or
-escalate it to a replace for operators who prefer an automatic recovery over a
-cheaper repair that their provider cannot offer.
+A Machine that no MachineHealthCheck selects, or only paused ones, is not
+marked, since the annotation would do nothing, or act at some arbitrary time
+after an unpause; the signal is reported with an Event instead. A
+restart signal on a Machine that a check without a template also selects is
+reported the same way, since marking it would replace the Machine. Escalating
+such a restart to a replacement, for operators who prefer an automatic
+recovery over a cheaper repair their provider cannot offer, is planned as an
+option.
 
 ## Planned safeguards
 
 - Dry-run is the default. Decisions are logged and nothing is written until
   remediation is enabled explicitly.
 - Control plane Machines are never remediated automatically.
-- A Machine that is already marked for remediation, or already being deleted,
-  is left alone.
+- A Machine that is already marked for remediation, already being deleted,
+  paused, or opted out with `cluster.x-k8s.io/skip-remediation` is left alone.
 - Every action leaves a Kubernetes Event on the Machine, because the Machine
   and its annotations disappear once remediation succeeds.
 
@@ -90,11 +97,11 @@ cheaper repair that their provider cannot offer.
 Done: signal decoder and decision table with tests built from real
 NVSentinel messages; the controller with workload cluster polling, Machine
 mapping and the replacement path, dry-run by default; the container image and
-kustomize deployment.
+kustomize deployment; restarts through the MachineHealthChecks' remediation
+templates.
 
-- Restart path through external remediation templates, with per-cluster
-  concurrency limits and cleanup of the remediation request once the node
-  recovers.
+- Releasing a restarted Machine once its signal clears, and an option to
+  escalate restarts that no template can carry out to a replacement.
 - `ExternalRemediationRequest` source, chosen per cluster, with the
   completion status reported back to NVSentinel.
 - Configurable decision table, Helm chart, integration tests.

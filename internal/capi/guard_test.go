@@ -63,8 +63,9 @@ func annotate(key string) func(*clusterv1.Machine) {
 }
 
 var (
-	marked = annotate(clusterv1.RemediateMachineAnnotation)
-	paused = annotate(clusterv1.PausedAnnotation)
+	marked   = annotate(clusterv1.RemediateMachineAnnotation)
+	paused   = annotate(clusterv1.PausedAnnotation)
+	optedOut = annotate(clusterv1.MachineSkipRemediationAnnotation)
 )
 
 func TestGuard(t *testing.T) {
@@ -78,12 +79,15 @@ func TestGuard(t *testing.T) {
 		{"already marked", newMachine("w", marked), SkipAlreadyMarked},
 		{"control plane", newMachine("w", controlPlane), SkipControlPlane},
 		{"paused", newMachine("w", paused), SkipPaused},
+		{"opted out", newMachine("w", optedOut), SkipOptedOut},
 		{"deleting outranks marked", newMachine("w", marked, deleting), SkipDeleting},
 		{"deleting outranks control plane", newMachine("w", controlPlane, deleting), SkipDeleting},
 		{"deleting outranks paused", newMachine("w", paused, deleting), SkipDeleting},
 		{"marked outranks control plane", newMachine("w", controlPlane, marked), SkipAlreadyMarked},
 		{"marked outranks paused", newMachine("w", paused, marked), SkipAlreadyMarked},
 		{"control plane outranks paused", newMachine("w", paused, controlPlane), SkipControlPlane},
+		{"paused outranks opted out", newMachine("w", optedOut, paused), SkipPaused},
+		{"marked outranks opted out", newMachine("w", optedOut, marked), SkipAlreadyMarked},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -122,8 +126,17 @@ func TestIsPausedUsesAnnotationPresence(t *testing.T) {
 	}
 }
 
+func TestIsOptedOutUsesAnnotationPresence(t *testing.T) {
+	if IsOptedOut(newMachine("w")) {
+		t.Fatal("Machine without the annotation reported as opted out")
+	}
+	if !IsOptedOut(newMachine("w", optedOut)) {
+		t.Fatal("annotated Machine not reported as opted out")
+	}
+}
+
 func TestSkipReasonMessage(t *testing.T) {
-	known := []SkipReason{SkipDeleting, SkipAlreadyMarked, SkipControlPlane, SkipPaused}
+	known := []SkipReason{SkipDeleting, SkipAlreadyMarked, SkipControlPlane, SkipPaused, SkipOptedOut}
 	seen := map[string]SkipReason{}
 	for _, s := range known {
 		msg := s.Message()
@@ -147,6 +160,7 @@ func TestSkipReasonInProgress(t *testing.T) {
 		SkipAlreadyMarked:   true,
 		SkipControlPlane:    false,
 		SkipPaused:          false,
+		SkipOptedOut:        false,
 		SkipReason("Other"): false,
 	}
 	for s, want := range inProgress {

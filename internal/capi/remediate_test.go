@@ -104,7 +104,7 @@ func TestMarkForRemediationStampsAnnotationsAndRecordsEvent(t *testing.T) {
 	})
 	a, rec := newActuator(t, m)
 
-	skip, err := a.MarkForRemediation(context.Background(), m, testReason)
+	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason)
 	if err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestMarkForRemediationWithoutExistingAnnotations(t *testing.T) {
 	m := newMachine("w")
 	a, _ := newActuator(t, m)
 
-	if skip, err := a.MarkForRemediation(context.Background(), m, testReason); err != nil || skip != "" {
+	if skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason); err != nil || skip != "" {
 		t.Fatalf("MarkForRemediation = %q, %v", skip, err)
 	}
 	if !IsMarkedForRemediation(stored(t, a.Client, m)) {
@@ -161,7 +161,7 @@ func TestMarkForRemediationSendsOnlyTheAnnotations(t *testing.T) {
 		}).Build()
 	a := &Actuator{Client: c, Recorder: events.NewFakeRecorder(1)}
 
-	if skip, err := a.MarkForRemediation(context.Background(), m, testReason); err != nil || skip != "" {
+	if skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason); err != nil || skip != "" {
 		t.Fatalf("MarkForRemediation = %q, %v", skip, err)
 	}
 
@@ -187,13 +187,13 @@ func TestMarkForRemediationDoesNotRestampAMarkedMachine(t *testing.T) {
 	m := newMachine("w")
 	a, rec := newActuator(t, m)
 
-	if _, err := a.MarkForRemediation(context.Background(), m, testReason); err != nil {
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason); err != nil {
 		t.Fatalf("first MarkForRemediation: %v", err)
 	}
 	<-rec.Events
 	before := stored(t, a.Client, m)
 
-	skip, err := a.MarkForRemediation(context.Background(), m, "a later, different reason")
+	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, "a later, different reason")
 	if err != nil {
 		t.Fatalf("second MarkForRemediation: %v", err)
 	}
@@ -220,6 +220,7 @@ func TestMarkForRemediationLeavesGuardedMachinesAlone(t *testing.T) {
 		{"deleting", deleting, SkipDeleting},
 		{"control plane", controlPlane, SkipControlPlane},
 		{"paused", paused, SkipPaused},
+		{"opted out", optedOut, SkipOptedOut},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -227,7 +228,7 @@ func TestMarkForRemediationLeavesGuardedMachinesAlone(t *testing.T) {
 			a, rec := newActuator(t, m)
 			before := stored(t, a.Client, m)
 
-			skip, err := a.MarkForRemediation(context.Background(), m, testReason)
+			skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason)
 			if err != nil {
 				t.Fatalf("MarkForRemediation: %v", err)
 			}
@@ -253,7 +254,7 @@ func TestMarkForRemediationDryRunWritesNothing(t *testing.T) {
 	a.DryRun = true
 	before := stored(t, a.Client, m)
 
-	skip, err := a.MarkForRemediation(context.Background(), m, testReason)
+	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason)
 	if err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
@@ -268,7 +269,7 @@ func TestMarkForRemediationDryRunWritesNothing(t *testing.T) {
 	assertNoEvent(t, rec)
 
 	// The guards still apply, so a dry run explains what a live run would skip.
-	if skip, _ := a.MarkForRemediation(context.Background(), newMachine("cp", controlPlane), testReason); skip != SkipControlPlane {
+	if skip, _ := a.MarkForRemediation(context.Background(), newMachine("cp", controlPlane), ActionRemediate, testReason); skip != SkipControlPlane {
 		t.Fatalf("dry run on a control plane Machine = %q, want %q", skip, SkipControlPlane)
 	}
 	assertNoEvent(t, rec)
@@ -280,7 +281,7 @@ func TestMarkForRemediationReportsPatchFailure(t *testing.T) {
 	m := newMachine("gone")
 	a, rec := newActuator(t)
 
-	skip, err := a.MarkForRemediation(context.Background(), m, testReason)
+	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason)
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("err = %v, want NotFound", err)
 	}
@@ -295,6 +296,32 @@ func TestMarkForRemediationReportsPatchFailure(t *testing.T) {
 		t.Fatal("in-memory Machine was marked although the patch failed")
 	}
 	assertNoEvent(t, rec)
+}
+
+// actionRecorder keeps the action of every Event, which FakeRecorder drops.
+type actionRecorder struct {
+	events.EventRecorder
+	actions []string
+}
+
+func (r *actionRecorder) Eventf(_, _ runtime.Object, _, _, action, _ string, _ ...any) {
+	r.actions = append(r.actions, action)
+}
+
+func TestMarkForRemediationRecordsTheCallersAction(t *testing.T) {
+	for _, action := range []string{ActionRemediate, ActionRestart} {
+		m := newMachine("w")
+		a, _ := newActuator(t, m)
+		rec := &actionRecorder{}
+		a.Recorder = rec
+
+		if _, err := a.MarkForRemediation(context.Background(), m, action, testReason); err != nil {
+			t.Fatalf("MarkForRemediation: %v", err)
+		}
+		if !reflect.DeepEqual(rec.actions, []string{action}) {
+			t.Fatalf("event actions = %q, want [%q]", rec.actions, action)
+		}
+	}
 }
 
 func TestEventNote(t *testing.T) {
@@ -315,7 +342,7 @@ func TestMarkForRemediationKeepsEventNotesWithinTheLimit(t *testing.T) {
 	m := newMachine("w")
 	a, rec := newActuator(t, m)
 
-	if _, err := a.MarkForRemediation(context.Background(), m, strings.Repeat("x", 2*EventNoteLimit)); err != nil {
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, strings.Repeat("x", 2*EventNoteLimit)); err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
 	e := <-rec.Events
@@ -328,23 +355,23 @@ func TestRecordSkipped(t *testing.T) {
 	m := newMachine("cp", controlPlane)
 	a, rec := newActuator(t, m)
 
-	a.RecordSkipped(m, SkipControlPlane, testReason)
+	a.RecordSkipped(m, SkipControlPlane, ActionRemediate, testReason)
 	assertEvent(t, rec, "Warning RemediationSkipped Remediation skipped because the Machine is a control plane member: "+testReason)
 
-	a.RecordSkipped(m, SkipPaused, testReason)
+	a.RecordSkipped(m, SkipPaused, ActionRemediate, testReason)
 	assertEvent(t, rec, "Warning RemediationSkipped Remediation skipped because the Machine is paused: "+testReason)
 
 	// Remediation under way is not a dropped fault, so it is not recorded
 	// on every poll.
-	a.RecordSkipped(m, SkipAlreadyMarked, testReason)
-	a.RecordSkipped(m, SkipDeleting, testReason)
+	a.RecordSkipped(m, SkipAlreadyMarked, ActionRemediate, testReason)
+	a.RecordSkipped(m, SkipDeleting, ActionRemediate, testReason)
 	assertNoEvent(t, rec)
 
 	// Nothing was skipped, so there is nothing to record.
-	a.RecordSkipped(m, "", testReason)
+	a.RecordSkipped(m, "", ActionRemediate, testReason)
 	assertNoEvent(t, rec)
 
 	a.DryRun = true
-	a.RecordSkipped(m, SkipControlPlane, testReason)
+	a.RecordSkipped(m, SkipControlPlane, ActionRemediate, testReason)
 	assertNoEvent(t, rec)
 }

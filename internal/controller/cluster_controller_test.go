@@ -96,6 +96,37 @@ func controlPlane(m *clusterv1.Machine) {
 	m.Labels[clusterv1.MachineControlPlaneLabel] = ""
 }
 
+// defaultHealthCheck is the check every fixture has unless told otherwise:
+// it covers every Machine of the Cluster and remediates by replacement,
+// which is what a ClusterClass topology generates by default.
+const defaultHealthCheck = "gpu-workers"
+
+var rebootTemplate = clusterv1.MachineHealthCheckRemediationTemplateReference{
+	APIVersion: "infrastructure.example.com/v1alpha1",
+	Kind:       "RebootRemediationTemplate",
+	Name:       "reboot",
+}
+
+func newHealthCheck(name string, mutate ...func(*clusterv1.MachineHealthCheck)) *clusterv1.MachineHealthCheck {
+	mhc := &clusterv1.MachineHealthCheck{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name},
+		Spec:       clusterv1.MachineHealthCheckSpec{ClusterName: testCluster},
+	}
+	for _, f := range mutate {
+		f(mhc)
+	}
+
+	return mhc
+}
+
+func withTemplate(mhc *clusterv1.MachineHealthCheck) {
+	mhc.Spec.Remediation.TemplateRef = rebootTemplate
+}
+
+func optedOut(m *clusterv1.Machine) {
+	m.Annotations = map[string]string{clusterv1.MachineSkipRemediationAnnotation: ""}
+}
+
 func newNode(name string, conds ...corev1.NodeCondition) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -117,7 +148,11 @@ type fixture struct {
 }
 
 type fixtureOptions struct {
-	dryRun        bool
+	dryRun bool
+	// healthChecks replace the default covering check; set uncovered to
+	// have none at all.
+	healthChecks  []*clusterv1.MachineHealthCheck
+	uncovered     bool
 	disconnected  bool
 	selector      labels.Selector
 	hubFuncs      interceptor.Funcs
@@ -128,6 +163,13 @@ func newFixture(t *testing.T, opts fixtureOptions, hubObjs []client.Object, node
 	t.Helper()
 
 	scheme := newScheme(t)
+	checks := opts.healthChecks
+	if checks == nil && !opts.uncovered {
+		checks = []*clusterv1.MachineHealthCheck{newHealthCheck(defaultHealthCheck)}
+	}
+	for _, mhc := range checks {
+		hubObjs = append(hubObjs, mhc)
+	}
 	hub := fake.NewClientBuilder().WithScheme(scheme).WithObjects(hubObjs...).WithInterceptorFuncs(opts.hubFuncs).Build()
 
 	nodeObjs := make([]client.Object, 0, len(nodes))
@@ -251,7 +293,8 @@ func TestReconcileMarksMachineForRemediation(t *testing.T) {
 	if !capi.IsMarkedForRemediation(m) {
 		t.Fatal("Machine not marked")
 	}
-	wantReason := "NodeCondition GpuXidError DCGM_FR_XID_ERROR gpu GPU-1234 (REPLACE_VM): REPLACE_VM maps to Replace"
+	wantReason := "NodeCondition GpuXidError DCGM_FR_XID_ERROR gpu GPU-1234 (REPLACE_VM): REPLACE_VM maps to Replace; " +
+		"MachineHealthCheck gpu-workers remediates by replacement"
 	if got := m.Annotations[capi.RemediationReasonAnnotation]; got != wantReason {
 		t.Fatalf("reason annotation = %q, want %q", got, wantReason)
 	}
@@ -311,7 +354,8 @@ func TestReconcileEscalationIsNews(t *testing.T) {
 		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, node)
 
 	assertPoll(t, f.reconcile(t))
-	assertEvents(t, f.events(), "Warning RestartUnavailable GpuXidError DCGM_FR_XID_ERROR (RESTART_BM) calls for a restart of node gpu-w-1, which is not available yet; reported only")
+	assertEvents(t, f.events(), "Warning RestartUnavailable GpuXidError DCGM_FR_XID_ERROR (RESTART_BM) calls for a restart of node gpu-w-1, "+
+		"but MachineHealthCheck gpu-workers remediates by replacement; reported only")
 	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
 		t.Fatal("a Restart decision marked the Machine")
 	}
@@ -509,6 +553,162 @@ func TestReconcileHonoursTheClusterSelector(t *testing.T) {
 	}
 }
 
+func TestReconcileRestartsThroughRemediationTemplates(t *testing.T) {
+	f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", restartMessage)))
+
+	assertPoll(t, f.reconcile(t))
+
+	m := f.machine(t, "gpu-w-1")
+	if !capi.IsMarkedForRemediation(m) {
+		t.Fatal("Restart covered by a remediation template did not mark the Machine")
+	}
+	wantReason := "NodeCondition GpuXidError GPU_FABRIC_DEGRADED (RESTART_BM): RESTART_BM maps to Restart; " +
+		"MachineHealthCheck reboot remediates through RebootRemediationTemplate reboot"
+	if got := m.Annotations[capi.RemediationReasonAnnotation]; got != wantReason {
+		t.Fatalf("reason annotation = %q, want %q", got, wantReason)
+	}
+	assertEvents(t, f.events(), "Warning MarkedForRemediation Marked for remediation: "+wantReason)
+
+	// Cluster API now owns the request; the signal persisting is not news.
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events())
+}
+
+func TestReconcileReportsRestartsNoTemplateCanCarryOut(t *testing.T) {
+	tests := []struct {
+		name   string
+		opts   fixtureOptions
+		reason string
+	}{
+		{"no check", fixtureOptions{uncovered: true}, "no MachineHealthCheck selects the Machine"},
+		{"replacement only", fixtureOptions{}, "MachineHealthCheck gpu-workers remediates by replacement"},
+		// A check without a template would replace the Machine alongside
+		// the one restarting it.
+		{"mixed", fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{
+			newHealthCheck("reboot", withTemplate), newHealthCheck("replace"),
+		}}, "MachineHealthCheck reboot remediates through RebootRemediationTemplate reboot; " +
+			"MachineHealthCheck replace remediates by replacement"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, tt.opts,
+				[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+				newNode("gpu-w-1", raised("GpuXidError", restartMessage)))
+
+			assertPoll(t, f.reconcile(t))
+			if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+				t.Fatal("Restart marked the Machine without a template to carry it out")
+			}
+			assertEvents(t, f.events(),
+				"Warning RestartUnavailable GpuXidError GPU_FABRIC_DEGRADED (RESTART_BM) calls for a restart of node gpu-w-1, but "+
+					tt.reason+"; reported only")
+
+			assertPoll(t, f.reconcile(t))
+			assertEvents(t, f.events())
+		})
+	}
+}
+
+func TestReconcileReportsReplacementsWithoutHealthCheck(t *testing.T) {
+	f := newFixture(t, fixtureOptions{uncovered: true},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", replaceMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Replace marked a Machine that no MachineHealthCheck selects")
+	}
+	assertEvents(t, f.events(), "Warning ReplaceUnavailable GpuXidError DCGM_FR_XID_ERROR gpu GPU-1234 (REPLACE_VM) "+
+		"calls for a replacement of node gpu-w-1, but no MachineHealthCheck selects the Machine; reported only")
+
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events())
+
+	// A check appearing changes what marking does: that is news, and acted on.
+	if err := f.hub.Create(context.Background(), newHealthCheck(defaultHealthCheck)); err != nil {
+		t.Fatalf("create machinehealthcheck: %v", err)
+	}
+	assertPoll(t, f.reconcile(t))
+	if !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine not marked once a MachineHealthCheck selects it")
+	}
+	assertEvents(t, f.events(), "Warning MarkedForRemediation")
+}
+
+func TestReconcileReportsReplacementsWhileTheHealthCheckIsPaused(t *testing.T) {
+	// A paused check would act on the annotation at some arbitrary time
+	// after it is unpaused; the signal is reported until then.
+	f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{
+		newHealthCheck(defaultHealthCheck, func(mhc *clusterv1.MachineHealthCheck) {
+			mhc.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
+		}),
+	}}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", replaceMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine marked while its only MachineHealthCheck is paused")
+	}
+	assertEvents(t, f.events(), "Warning ReplaceUnavailable GpuXidError DCGM_FR_XID_ERROR gpu GPU-1234 (REPLACE_VM) "+
+		"calls for a replacement of node gpu-w-1, but MachineHealthCheck gpu-workers remediates by replacement (paused); reported only")
+
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events())
+}
+
+func TestReconcileReplacesThroughTemplatesFirst(t *testing.T) {
+	// A Replace on a Machine whose check remediates through a template gets
+	// the template first; the reason records that.
+	f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", replaceMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	m := f.machine(t, "gpu-w-1")
+	if !capi.IsMarkedForRemediation(m) {
+		t.Fatal("Machine not marked")
+	}
+	if got := m.Annotations[capi.RemediationReasonAnnotation]; !strings.HasSuffix(got,
+		"; MachineHealthCheck reboot remediates through RebootRemediationTemplate reboot") {
+		t.Fatalf("reason annotation = %q, want it to name the template", got)
+	}
+}
+
+func TestReconcileDryRunRestartOnlyLogs(t *testing.T) {
+	f := newFixture(t, fixtureOptions{dryRun: true, healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", restartMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("dry run marked the Machine")
+	}
+	assertEvents(t, f.events())
+
+	obs, _ := f.observed("gpu-w-1/GpuXidError")
+	if obs.Decision != decision.Restart || obs.Skip != "" ||
+		obs.Coverage != "MachineHealthCheck reboot remediates through RebootRemediationTemplate reboot" {
+		t.Fatalf("observation = %+v, want a Restart through the template", obs)
+	}
+}
+
+func TestReconcileSkipsMachinesOptedOutOfRemediation(t *testing.T) {
+	f := newFixture(t, fixtureOptions{},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", optedOut)},
+		newNode("gpu-w-1", raised("GpuXidError", replaceMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("opted-out Machine was marked")
+	}
+	assertEvents(t, f.events(), "Warning RemediationSkipped Remediation skipped because the Machine has opted out of remediation")
+
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events())
+}
+
 // failingCache is a ClusterCache whose reader fails for a reason other than
 // a missing connection.
 type failingCache struct {
@@ -538,6 +738,14 @@ func TestReconcileReturnsErrorsWorthRetrying(t *testing.T) {
 		{"listing Machines fails", func(*fixture) {}, fixtureOptions{hubFuncs: interceptor.Funcs{
 			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
 				return boom
+			},
+		}}},
+		{"listing MachineHealthChecks fails", func(*fixture) {}, fixtureOptions{hubFuncs: interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*clusterv1.MachineHealthCheckList); ok {
+					return boom
+				}
+				return c.List(ctx, list, opts...)
 			},
 		}}},
 		{"the cluster cache fails", func(f *fixture) {
