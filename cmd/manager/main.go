@@ -57,6 +57,7 @@ func main() {
 		metricsAddr     string
 		probeAddr       string
 		clusterSelector string
+		restartFallback string
 		leaderElect     bool
 		dryRun          bool
 		pollInterval    time.Duration
@@ -73,6 +74,9 @@ func main() {
 		"How often each workload cluster's signals are read.")
 	flag.StringVar(&clusterSelector, "cluster-selector", "",
 		"Label selector limiting which Clusters are watched, e.g. environment=gpu. Empty selects every Cluster.")
+	flag.StringVar(&restartFallback, "restart-fallback", string(controller.RestartFallbackReport),
+		"What to do with a restart that no remediation template can carry out: report it, or replace the Machine instead. "+
+			"A Cluster overrides it with the "+controller.RestartFallbackAnnotation+" annotation.")
 	zapOpts := zap.Options{}
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -87,6 +91,12 @@ func main() {
 			os.Exit(1)
 		}
 		selector = s
+	}
+
+	fallback, err := controller.ParseRestartFallback(restartFallback)
+	if err != nil {
+		setupLog.Error(err, "invalid --restart-fallback")
+		os.Exit(1)
 	}
 
 	cacheOpts := cache.Options{}
@@ -142,6 +152,7 @@ func main() {
 		DryRun:          dryRun,
 		PollInterval:    pollInterval,
 		ClusterSelector: selector,
+		RestartFallback: fallback,
 	}
 	if err := reconciler.SetupWithManager(ctx, mgr, ctrlcontroller.Options{MaxConcurrentReconciles: 1}); err != nil {
 		setupLog.Error(err, "unable to set up controller", "controller", controller.ControllerName)
@@ -161,6 +172,7 @@ func main() {
 		"dryRun", dryRun,
 		"pollInterval", pollInterval,
 		"clusterSelector", clusterSelector,
+		"restartFallback", fallback,
 		"decisionTable", table.Entries(),
 	)
 	if err := mgr.Start(ctx); err != nil {

@@ -36,8 +36,9 @@ import (
 )
 
 const (
-	// AnnotationPrefix scopes every annotation this operator writes. It is
-	// the one place to change should the project move to another owner.
+	// AnnotationPrefix scopes every annotation this operator reads or
+	// writes. It is the one place to change should the project move to
+	// another owner.
 	AnnotationPrefix = "nvsentinel.petasus.io"
 
 	// RemediationReasonAnnotation records why this operator asked Cluster API

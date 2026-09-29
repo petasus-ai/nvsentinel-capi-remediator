@@ -81,12 +81,22 @@ that every infrastructure provider already speaks:
 
 A Machine that no MachineHealthCheck selects, or only paused ones, is not
 marked, since the annotation would do nothing, or act at some arbitrary time
-after an unpause; the signal is reported with an Event instead. A
-restart signal on a Machine that a check without a template also selects is
-reported the same way, since marking it would replace the Machine. Escalating
-such a restart to a replacement, for operators who prefer an automatic
-recovery over a cheaper repair their provider cannot offer, is planned as an
-option.
+after an unpause; the signal is reported with an Event instead. A restart
+that no template can carry out, because no active check selects the Machine
+or one without a template does, follows the restart fallback:
+
+- `report` (the default) reports it the same way, since marking the Machine
+  would replace it.
+- `replace` marks it for a replacement instead, for operators who prefer an
+  automatic recovery over a cheaper repair their provider cannot offer. That
+  mark is never removed, and an earlier restart mark on the Machine becomes a
+  replacement mark. It still needs a MachineHealthCheck to act on it.
+
+The fallback is set with `--restart-fallback` and overridden per cluster with
+the `nvsentinel.petasus.io/restart-fallback` annotation on the Cluster (under
+the operator's annotation prefix), which takes effect on the next poll. An
+invalid annotation is ignored, and the Events of the signals it affects say
+so.
 
 ## Planned safeguards
 
@@ -104,10 +114,8 @@ Done: signal decoder and decision table with tests built from real
 NVSentinel messages; the controller with workload cluster polling, Machine
 mapping and the replacement path, dry-run by default; the container image and
 kustomize deployment; restarts through the MachineHealthChecks' remediation
-templates, released again once the signal clears.
-
-- An option to fall back to a replacement for restarts that no template can
-  carry out.
+templates, released again once the signal clears, with a configurable
+fallback for restarts no template can carry out.
 - `ExternalRemediationRequest` source, chosen per cluster, with the
   completion status reported back to NVSentinel.
 - Configurable decision table, Helm chart, integration tests.

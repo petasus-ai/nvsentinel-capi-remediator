@@ -151,12 +151,13 @@ type fixtureOptions struct {
 	dryRun bool
 	// healthChecks replace the default covering check; set uncovered to
 	// have none at all.
-	healthChecks  []*clusterv1.MachineHealthCheck
-	uncovered     bool
-	disconnected  bool
-	selector      labels.Selector
-	hubFuncs      interceptor.Funcs
-	workloadFuncs interceptor.Funcs
+	healthChecks    []*clusterv1.MachineHealthCheck
+	uncovered       bool
+	restartFallback RestartFallback
+	disconnected    bool
+	selector        labels.Selector
+	hubFuncs        interceptor.Funcs
+	workloadFuncs   interceptor.Funcs
 }
 
 func newFixture(t *testing.T, opts fixtureOptions, hubObjs []client.Object, nodes ...*corev1.Node) *fixture {
@@ -197,6 +198,7 @@ func newFixture(t *testing.T, opts fixtureOptions, hubObjs []client.Object, node
 			DryRun:          opts.dryRun,
 			PollInterval:    time.Minute,
 			ClusterSelector: opts.selector,
+			RestartFallback: opts.restartFallback,
 		},
 	}
 }
@@ -707,6 +709,147 @@ func TestReconcileSkipsMachinesOptedOutOfRemediation(t *testing.T) {
 
 	assertPoll(t, f.reconcile(t))
 	assertEvents(t, f.events())
+}
+
+func TestParseRestartFallback(t *testing.T) {
+	for _, in := range []string{"report", "replace"} {
+		if got, err := ParseRestartFallback(in); err != nil || string(got) != in {
+			t.Errorf("ParseRestartFallback(%q) = %q, %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"", "Replace", "delete"} {
+		if _, err := ParseRestartFallback(in); err == nil {
+			t.Errorf("ParseRestartFallback(%q) accepted", in)
+		}
+	}
+}
+
+func withRestartFallback(value string) func(*clusterv1.Cluster) {
+	return func(c *clusterv1.Cluster) {
+		c.Annotations = map[string]string{RestartFallbackAnnotation: value}
+	}
+}
+
+func TestReconcileRestartFallback(t *testing.T) {
+	const fallbackReason = "NodeCondition GpuXidError GPU_FABRIC_DEGRADED (RESTART_BM): RESTART_BM maps to Restart, " +
+		"which no remediation template can carry out; falling back to a replacement; " +
+		"MachineHealthCheck gpu-workers remediates by replacement"
+
+	tests := []struct {
+		name     string
+		global   RestartFallback
+		cluster  *clusterv1.Cluster
+		opts     fixtureOptions
+		replaced bool
+		event    string
+	}{
+		{"default reports", "", newCluster(), fixtureOptions{}, false,
+			"Warning RestartUnavailable GpuXidError GPU_FABRIC_DEGRADED (RESTART_BM) calls for a restart of node gpu-w-1, " +
+				"but MachineHealthCheck gpu-workers remediates by replacement; reported only (restart fallback report)"},
+		{"replace", RestartFallbackReplace, newCluster(), fixtureOptions{}, true,
+			"Warning MarkedForRemediation Marked for remediation: " + fallbackReason},
+		{"replace needs a health check too", RestartFallbackReplace, newCluster(), fixtureOptions{uncovered: true}, false,
+			"Warning RestartUnavailable GpuXidError GPU_FABRIC_DEGRADED (RESTART_BM) calls for a restart of node gpu-w-1, " +
+				"but no MachineHealthCheck selects the Machine; reported only (restart fallback replace)"},
+		{"cluster opts into replace", RestartFallbackReport, newCluster(withRestartFallback("replace")), fixtureOptions{}, true,
+			"Warning MarkedForRemediation Marked for remediation: " + fallbackReason},
+		{"cluster opts out of replace", RestartFallbackReplace, newCluster(withRestartFallback("report")), fixtureOptions{}, false,
+			"Warning RestartUnavailable"},
+		{"invalid override is ignored and said so", RestartFallbackReport, newCluster(withRestartFallback("reboot")), fixtureOptions{}, false,
+			"reported only (restart fallback report; the Cluster's nvsentinel.petasus.io/restart-fallback annotation is ignored: " +
+				`restart fallback "reboot" is neither "report" nor "replace")`},
+		// A typo meant to opt out must show where it matters most: on the
+		// replacement it failed to prevent.
+		{"invalid override under replace is said so", RestartFallbackReplace, newCluster(withRestartFallback("Report")), fixtureOptions{}, true,
+			"falling back to a replacement; the Cluster's nvsentinel.petasus.io/restart-fallback annotation is ignored: " +
+				`restart fallback "Report" is neither "report" nor "replace"; MachineHealthCheck gpu-workers remediates by replacement`},
+		{"replace with mixed checks", RestartFallbackReplace, newCluster(), fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{
+			newHealthCheck("reboot", withTemplate), newHealthCheck("replace"),
+		}}, true, "falling back to a replacement; MachineHealthCheck reboot remediates through RebootRemediationTemplate reboot; " +
+			"MachineHealthCheck replace remediates by replacement"},
+		{"replace with only paused checks", RestartFallbackReplace, newCluster(), fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{
+			newHealthCheck(defaultHealthCheck, func(mhc *clusterv1.MachineHealthCheck) {
+				mhc.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
+			}),
+		}}, false, "but MachineHealthCheck gpu-workers remediates by replacement (paused); reported only (restart fallback replace)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := tt.opts
+			opts.restartFallback = tt.global
+			node := newNode("gpu-w-1", raised("GpuXidError", restartMessage))
+			f := newFixture(t, opts, []client.Object{tt.cluster, newMachine("gpu-w-1", "gpu-w-1")}, node)
+
+			assertPoll(t, f.reconcile(t))
+			action, marked := capi.MarkedAction(f.machine(t, "gpu-w-1"))
+			if marked != tt.replaced || (marked && action != capi.ActionRemediate) {
+				t.Fatalf("MarkedAction = %q, %v; want marked for a replacement: %v", action, marked, tt.replaced)
+			}
+			assertEvents(t, f.events(), tt.event)
+
+			assertPoll(t, f.reconcile(t))
+			assertEvents(t, f.events())
+
+			// A replacement in place of a restart is never released.
+			lower(t, f, node)
+			assertPoll(t, f.reconcile(t))
+			if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) != tt.replaced {
+				t.Fatal("the fallback replacement was released")
+			}
+		})
+	}
+}
+
+func TestReconcileRestartFallbackEscalatesAnEarlierRestartMark(t *testing.T) {
+	// The Machine was marked for a restart while every check had a
+	// template; a check without one appeared since. Under the replace
+	// fallback the mark becomes a replacement mark, which is never released.
+	node := newNode("gpu-w-1", raised("GpuXidError", restartMessage))
+	f := newFixture(t, fixtureOptions{restartFallback: RestartFallbackReplace},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart))}, node)
+
+	assertPoll(t, f.reconcile(t))
+	if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRemediate {
+		t.Fatalf("MarkedAction = %q, want the restart escalated to %q", action, capi.ActionRemediate)
+	}
+	assertEvents(t, f.events(), "Warning MarkedForRemediation Restart escalated to a replacement")
+
+	lower(t, f, node)
+	assertPoll(t, f.reconcile(t))
+	if !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("escalated Machine was released")
+	}
+}
+
+func TestReconcileRestartFallbackChangeIsNews(t *testing.T) {
+	cluster := newCluster()
+	f := newFixture(t, fixtureOptions{uncovered: true}, []client.Object{cluster, newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", restartMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events(), "(restart fallback report)")
+
+	cluster.Annotations = map[string]string{RestartFallbackAnnotation: "replace"}
+	if err := f.hub.Update(context.Background(), cluster); err != nil {
+		t.Fatalf("update cluster: %v", err)
+	}
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events(), "(restart fallback replace)")
+}
+
+func TestReconcileDryRunRestartFallback(t *testing.T) {
+	f := newFixture(t, fixtureOptions{dryRun: true, restartFallback: RestartFallbackReplace},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", restartMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("dry run marked the Machine")
+	}
+	assertEvents(t, f.events())
+	if obs, _ := f.observed("gpu-w-1/GpuXidError"); obs.Fallback != "replace" || obs.Skip != "" {
+		t.Fatalf("observation = %+v, want the replace fallback", obs)
+	}
 }
 
 // markedFor marks the Machine the way the actuator does.

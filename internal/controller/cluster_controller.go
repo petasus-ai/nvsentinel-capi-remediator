@@ -82,6 +82,35 @@ const (
 	EventMachineNotFound = "MachineNotFound"
 )
 
+// RestartFallback is what happens to a restart that no remediation template
+// can carry out.
+type RestartFallback string
+
+const (
+	// RestartFallbackReport reports the signal with an Event and leaves the
+	// Machine alone. It is the default: a restart is the cheaper repair,
+	// and replacing a node for it is a choice to make deliberately.
+	RestartFallbackReport RestartFallback = "report"
+	// RestartFallbackReplace hands the Machine to Cluster API for a
+	// replacement instead, for operators who prefer an automatic recovery
+	// over a repair their provider cannot offer.
+	RestartFallbackReplace RestartFallback = "replace"
+)
+
+// RestartFallbackAnnotation on a Cluster overrides the operator's restart
+// fallback for that Cluster, with the value report or replace.
+const RestartFallbackAnnotation = capi.AnnotationPrefix + "/restart-fallback"
+
+// ParseRestartFallback validates a restart fallback given as text.
+func ParseRestartFallback(s string) (RestartFallback, error) {
+	switch f := RestartFallback(s); f {
+	case RestartFallbackReport, RestartFallbackReplace:
+		return f, nil
+	default:
+		return "", fmt.Errorf("restart fallback %q is neither %q nor %q", s, RestartFallbackReport, RestartFallbackReplace)
+	}
+}
+
 // ClusterReconciler polls the workload clusters of a management cluster and
 // decides, per signal, what to do to the Machine behind the node.
 type ClusterReconciler struct {
@@ -103,6 +132,10 @@ type ClusterReconciler struct {
 	// ClusterSelector limits the Clusters acted on. Nil selects every
 	// Cluster.
 	ClusterSelector labels.Selector
+	// RestartFallback is what happens to a restart that no remediation
+	// template can carry out, unless the Cluster overrides it with
+	// RestartFallbackAnnotation. Empty means RestartFallbackReport.
+	RestartFallback RestartFallback
 
 	mu sync.Mutex
 	// seen holds, per Cluster, what was last concluded about each signal,
@@ -131,6 +164,9 @@ type observation struct {
 	// when the decision called for them. A change in them changes what
 	// marking the Machine does.
 	Coverage string
+	// Fallback is the restart fallback applied, when a restart could not
+	// be carried out, with a note when the Cluster's override was invalid.
+	Fallback string
 }
 
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
@@ -255,7 +291,7 @@ func (r *ClusterReconciler) handle(
 		r.report(log, obs != previous, cluster, EventMachineNotFound, ActionReport,
 			fmt.Sprintf("node %s reports %s but no Machine owns it", sig.Node, describe(sig)))
 	case outcome.Decision == decision.Replace, outcome.Decision == decision.Restart:
-		return r.remediate(ctx, log, checks, sig, outcome, machine, obs, previous)
+		return r.remediate(ctx, log, cluster, checks, sig, outcome, machine, obs, previous)
 	default:
 		r.report(log, obs != previous, machine, EventNodeHealthReported, ActionReport,
 			fmt.Sprintf("%s on node %s: %s", describe(sig), sig.Node, outcome.Reason))
@@ -267,17 +303,40 @@ func (r *ClusterReconciler) handle(
 // remediate hands the Machine to Cluster API when the MachineHealthChecks
 // selecting it will do what the decision asks: any remediation at all for
 // a Replace, and only remediation templates for a Restart, since a check
-// without a template would replace the Machine instead. Otherwise the
-// signal is reported. Guards come first, so that a Machine already being
-// remediated reads as in progress rather than unavailable.
+// without a template would replace the Machine instead. A Restart that no
+// template can carry out follows the restart fallback: reported, or
+// handed over as a Replace. Otherwise the signal is reported. Guards come
+// first, so that a Machine already being remediated reads as in progress
+// rather than unavailable.
 func (r *ClusterReconciler) remediate(
-	ctx context.Context, log logr.Logger, checks []clusterv1.MachineHealthCheck,
+	ctx context.Context, log logr.Logger, cluster *clusterv1.Cluster, checks []clusterv1.MachineHealthCheck,
 	sig signal.Signal, outcome decision.Outcome, machine *clusterv1.Machine, obs, previous observation,
 ) observation {
 	restart := outcome.Decision == decision.Restart
 	action, verb := capi.ActionRemediate, "a replacement"
 	if restart {
 		action, verb = capi.ActionRestart, "a restart"
+	}
+
+	// The checks decide what marking does, and so whether a restart can be
+	// asked for at all or falls back.
+	cov := capi.CoverageOf(checks, machine)
+	// It stays set when the replace fallback takes over, so that the
+	// fallback applied is recorded on both paths.
+	restartUnavailable := restart && !cov.TemplatesOnly()
+	var (
+		fallback     RestartFallback
+		fallbackNote string
+	)
+	if restartUnavailable {
+		fallback, fallbackNote = r.restartFallback(cluster)
+		// Replacing needs a MachineHealthCheck too, so without one the
+		// replace fallback has nothing to hand the Machine to either.
+		if fallback == RestartFallbackReplace && cov.Covered() {
+			restart = false
+			action, verb = capi.ActionRemediate, "a replacement in place of a restart"
+			outcome.Reason += ", which no remediation template can carry out; falling back to a replacement" + fallbackNote
+		}
 	}
 
 	if !restart {
@@ -311,15 +370,18 @@ func (r *ClusterReconciler) remediate(
 		return obs
 	}
 
-	cov := capi.CoverageOf(checks, machine)
 	obs.Coverage = cov.Describe()
 	log = log.WithValues("coverage", obs.Coverage)
+	if restartUnavailable {
+		obs.Fallback = string(fallback) + fallbackNote
+		log = log.WithValues("restartFallback", obs.Fallback)
+	}
 
 	switch {
-	case restart && !cov.TemplatesOnly():
+	case restart && restartUnavailable:
 		r.report(log, obs != previous, machine, EventRestartUnavailable, capi.ActionRestart,
-			fmt.Sprintf("%s calls for a restart of node %s, but %s; reported only",
-				describe(sig), sig.Node, obs.Coverage))
+			fmt.Sprintf("%s calls for a restart of node %s, but %s; reported only (restart fallback %s)",
+				describe(sig), sig.Node, obs.Coverage, obs.Fallback))
 		return obs
 	case !restart && !cov.Covered():
 		r.report(log, obs != previous, machine, EventReplaceUnavailable, capi.ActionRemediate,
@@ -335,7 +397,7 @@ func (r *ClusterReconciler) remediate(
 	reason := fmt.Sprintf("%s %s: %s; %s", sig.Origin, describe(sig), outcome.Reason, obs.Coverage)
 
 	if r.DryRun {
-		r.report(log, obs != previous, nil, "", "", "would mark Machine for remediation, asking for "+verb)
+		r.report(log, obs != previous, nil, "", "", "would mark Machine for remediation, asking for "+verb+fallbackNote)
 		return obs
 	}
 
@@ -352,6 +414,28 @@ func (r *ClusterReconciler) remediate(
 	log.Info("Machine marked for remediation", "asking", verb)
 
 	return obs
+}
+
+// restartFallback returns the restart fallback for the Cluster: its
+// annotation when that holds a valid value, the operator's setting
+// otherwise. The note explains an annotation that was ignored, so that the
+// mistake shows in the Events of the signals it affects.
+func (r *ClusterReconciler) restartFallback(cluster *clusterv1.Cluster) (RestartFallback, string) {
+	fallback := r.RestartFallback
+	if fallback == "" {
+		fallback = RestartFallbackReport
+	}
+
+	value, ok := cluster.Annotations[RestartFallbackAnnotation]
+	if !ok {
+		return fallback, ""
+	}
+	override, err := ParseRestartFallback(value)
+	if err != nil {
+		return fallback, fmt.Sprintf("; the Cluster's %s annotation is ignored: %v", RestartFallbackAnnotation, err)
+	}
+
+	return override, ""
 }
 
 // releaseRestarts releases every Machine this operator marked for a
