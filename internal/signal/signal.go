@@ -94,6 +94,10 @@ type Signal struct {
 	// Truncated reports that the source dropped trailing events for this
 	// check, so Actions may be missing the most disruptive one.
 	Truncated bool
+	// Request names the ExternalRemediationRequest the signal was read
+	// from, so that the outcome can be reported back to it. It is empty for
+	// other origins.
+	Request string
 }
 
 // Key identifies the fault a Signal reports, independently of which source
