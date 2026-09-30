@@ -46,7 +46,6 @@ import (
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/capi"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/decision"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/signal"
-	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/signal/condition"
 )
 
 // ControllerName names the controller in logs, Events and the cluster cache.
@@ -64,6 +63,13 @@ const (
 	// ActionReport is the action of Events about signals that are reported
 	// and not acted on.
 	ActionReport = "Report"
+	// ActionSelectSource is the action of Events about choosing where a
+	// cluster's signals are read from.
+	ActionSelectSource = "SelectSource"
+
+	// EventSignalSourceSelected is recorded on the Cluster when the mode it
+	// is read in is first chosen or changes.
+	EventSignalSourceSelected = "SignalSourceSelected"
 
 	// EventNodeHealthReported is recorded on the Machine when a signal is
 	// reported and nothing is done about it.
@@ -146,6 +152,9 @@ type ClusterReconciler struct {
 	// to be released, which it never releases, so that saying so happens
 	// once rather than on every poll.
 	wouldRelease map[client.ObjectKey]map[string]bool
+	// modes holds the mode each Cluster was last read in, so that a change
+	// is logged and recorded once.
+	modes map[client.ObjectKey]Mode
 }
 
 // observation is the conclusion reached about one signal. It deliberately
@@ -158,6 +167,9 @@ type observation struct {
 	Truncated bool
 	// Machine is the Machine behind the node, empty when none owns it.
 	Machine string
+	// Request names the ExternalRemediationRequest the signal came from. A
+	// new request for the same node and check is a new fault.
+	Request string
 	// Skip is why a remediation was not carried out, if it was not.
 	Skip capi.SkipReason
 	// Coverage describes the MachineHealthChecks selecting the Machine,
@@ -207,7 +219,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
 	}
 
-	reader, err := r.ClusterCache.GetReader(ctx, req.NamespacedName)
+	workload, err := r.ClusterCache.GetClient(ctx, req.NamespacedName)
 	if err != nil {
 		if errors.Is(err, clustercache.ErrClusterNotConnected) {
 			// The Cluster is still provisioning, or its API server is
@@ -220,7 +232,16 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("workload client for %s: %w", req.NamespacedName, err)
 	}
 
-	source := condition.NewSource(reader)
+	mode, err := selectMode(workload.RESTMapper())
+	if err != nil {
+		// Discovery fails like any other read of an API server that is
+		// going through an upgrade. Poll again.
+		log.Info("selecting the signal source failed, will retry", "error", err.Error())
+		return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
+	}
+	r.noteMode(log, cluster, mode)
+
+	source := mode.source(workload)
 	signals, err := source.Collect(ctx)
 	if err != nil {
 		// Workload API servers come and go during upgrades and rollouts.
@@ -244,9 +265,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	previous := r.observations(req.NamespacedName)
 	current := make(map[string]observation, len(signals))
 	for _, sig := range signals {
-		current[sig.Key()] = r.handle(ctx, cluster, checks, sig, machines[sig.Node], previous[sig.Key()])
+		current[sig.Key()] = r.handle(ctx, cluster, mode, checks, sig, machines[sig.Node], previous[sig.Key()])
 	}
-	r.releaseRestarts(ctx, req.NamespacedName, machines, current)
+	r.releaseRestarts(ctx, req.NamespacedName, source.Name(), machines, current)
 	r.remember(ctx, req.NamespacedName, previous, current)
 
 	return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
@@ -255,13 +276,19 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 // handle decides one signal, acts on it and returns what was concluded. The
 // previous observation decides whether the signal is news: only news is
 // logged at the default level and recorded as an Event, so a fault that
-// persists across polls does not repeat itself.
+// persists across polls does not repeat itself. In ModeReportOnly every
+// decision is reported, whatever the table says, and so is a restart read
+// from an ExternalRemediationRequest (see reportOnly).
 func (r *ClusterReconciler) handle(
-	ctx context.Context, cluster *clusterv1.Cluster, checks []clusterv1.MachineHealthCheck,
+	ctx context.Context, cluster *clusterv1.Cluster, mode Mode, checks []clusterv1.MachineHealthCheck,
 	sig signal.Signal, machine *clusterv1.Machine, previous observation,
 ) observation {
 	outcome := r.Table.Decide(sig)
-	obs := observation{Decision: outcome.Decision, Action: outcome.Action, Truncated: sig.Truncated}
+	if why := reportOnly(mode, outcome.Decision); why != "" {
+		outcome.Reason += "; reported only since " + why
+		outcome.Decision = decision.Report
+	}
+	obs := observation{Decision: outcome.Decision, Action: outcome.Action, Truncated: sig.Truncated, Request: sig.Request}
 	if machine != nil {
 		obs.Machine = machine.Name
 	}
@@ -439,8 +466,8 @@ func (r *ClusterReconciler) restartFallback(cluster *clusterv1.Cluster) (Restart
 }
 
 // releaseRestarts releases every Machine this operator marked for a
-// restart once no signal of its node calls for a restart or a replacement
-// any more. NVSentinel lowers a condition when its check passes again:
+// restart once no signal this operator acts on calls for a restart or a
+// replacement of its node any more. NVSentinel lowers a condition when its check passes again:
 // monitors reading the kernel log clear their conditions once they see a
 // new boot, and GPU checks on their first passing run. After a restart
 // that is the sign the restart worked; a condition lowered before the
@@ -457,7 +484,9 @@ func (r *ClusterReconciler) restartFallback(cluster *clusterv1.Cluster) (Restart
 // unhealthy on their own. Only Machines with a node are considered, which
 // every Machine this operator marks has, since it marks them through their
 // node.
-func (r *ClusterReconciler) releaseRestarts(ctx context.Context, key client.ObjectKey, machines map[string]*clusterv1.Machine, current map[string]observation) {
+func (r *ClusterReconciler) releaseRestarts(
+	ctx context.Context, key client.ObjectKey, source string, machines map[string]*clusterv1.Machine, current map[string]observation,
+) {
 	held := map[string]bool{}
 	for _, obs := range current {
 		if obs.Machine != "" && (obs.Decision == decision.Replace || obs.Decision == decision.Restart) {
@@ -482,7 +511,7 @@ func (r *ClusterReconciler) releaseRestarts(ctx context.Context, key client.Obje
 
 		log := ctrl.LoggerFrom(ctx).WithValues("node", node, "machine", m.Name, "dryRun", r.DryRun)
 		released, err := r.actuator().Release(ctx, m,
-			fmt.Sprintf("no signal on node %s calls for a restart or a replacement any more", node))
+			fmt.Sprintf("no %s signal this operator acts on calls for a restart or a replacement of node %s any more", source, node))
 		switch {
 		case err != nil:
 			// The next poll tries again.
@@ -497,6 +526,26 @@ func (r *ClusterReconciler) releaseRestarts(ctx context.Context, key client.Obje
 		case released:
 			log.Info("Machine released from remediation, its restart signal cleared")
 		}
+	}
+}
+
+// reportOnly returns why a decision taken in the mode is only reported, or
+// the empty string when it may be acted on.
+//
+// A restart asked for through an ExternalRemediationRequest is reported
+// for now: the request stays pending until it is answered, which this
+// operator does not do yet, so a Machine marked for the restart would never
+// be released and its provider would give up and have it replaced.
+func reportOnly(mode Mode, d decision.Decision) string {
+	switch {
+	case d == decision.Report:
+		return ""
+	case mode == ModeReportOnly:
+		return "NVSentinel's janitor remediates this cluster itself"
+	case mode == ModeExternalRemediationRequest && d == decision.Restart:
+		return "answering ExternalRemediationRequests, which releasing a restarted Machine depends on, is not implemented yet"
+	default:
+		return ""
 	}
 }
 
@@ -616,6 +665,38 @@ func (r *ClusterReconciler) forget(key client.ObjectKey) {
 
 	delete(r.seen, key)
 	delete(r.wouldRelease, key)
+	delete(r.modes, key)
+}
+
+// noteMode remembers the mode the Cluster is read in and, when that is new,
+// logs it and records it as an Event on the Cluster. A change of mode also
+// drops what was concluded in the old one: the signals now come from
+// another source, and those of the old one have not cleared.
+func (r *ClusterReconciler) noteMode(log logr.Logger, cluster *clusterv1.Cluster, mode Mode) {
+	key := client.ObjectKeyFromObject(cluster)
+
+	r.mu.Lock()
+	previous, known := r.modes[key]
+	if r.modes == nil {
+		r.modes = map[client.ObjectKey]Mode{}
+	}
+	r.modes[key] = mode
+	if known && previous != mode {
+		delete(r.seen, key)
+		delete(r.wouldRelease, key)
+	}
+	r.mu.Unlock()
+
+	if known && previous == mode {
+		return
+	}
+
+	log.Info("signal source selected", "mode", mode, "previousMode", previous)
+	if r.DryRun {
+		return
+	}
+	r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, EventSignalSourceSelected, ActionSelectSource,
+		"%s", capi.EventNote(string(mode)+": "+mode.describe()))
 }
 
 // releasableBefore reports whether the last poll of the Cluster already

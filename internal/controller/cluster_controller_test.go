@@ -24,7 +24,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -39,6 +41,7 @@ import (
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/capi"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/decision"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/signal"
+	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/signal/extrr"
 )
 
 const (
@@ -145,6 +148,10 @@ type fixture struct {
 	workload client.Client
 	recorder *events.FakeRecorder
 	r        *ClusterReconciler
+	// sourceEvents collects the SignalSourceSelected Events drained by
+	// events, which every first poll records and most tests do not care
+	// about.
+	sourceEvents []string
 }
 
 type fixtureOptions struct {
@@ -154,10 +161,15 @@ type fixtureOptions struct {
 	healthChecks    []*clusterv1.MachineHealthCheck
 	uncovered       bool
 	restartFallback RestartFallback
-	disconnected    bool
-	selector        labels.Selector
-	hubFuncs        interceptor.Funcs
-	workloadFuncs   interceptor.Funcs
+	// workloadMapper sets what the workload cluster serves; by default
+	// nothing beyond the built-in kinds, so node conditions are read.
+	workloadMapper meta.RESTMapper
+	// workloadObjs are added to the workload cluster next to the nodes.
+	workloadObjs  []client.Object
+	disconnected  bool
+	selector      labels.Selector
+	hubFuncs      interceptor.Funcs
+	workloadFuncs interceptor.Funcs
 }
 
 func newFixture(t *testing.T, opts fixtureOptions, hubObjs []client.Object, nodes ...*corev1.Node) *fixture {
@@ -173,11 +185,15 @@ func newFixture(t *testing.T, opts fixtureOptions, hubObjs []client.Object, node
 	}
 	hub := fake.NewClientBuilder().WithScheme(scheme).WithObjects(hubObjs...).WithInterceptorFuncs(opts.hubFuncs).Build()
 
-	nodeObjs := make([]client.Object, 0, len(nodes))
+	workloadObjs := append([]client.Object{}, opts.workloadObjs...)
 	for _, n := range nodes {
-		nodeObjs = append(nodeObjs, n)
+		workloadObjs = append(workloadObjs, n)
 	}
-	workload := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObjs...).WithInterceptorFuncs(opts.workloadFuncs).Build()
+	workloadBuilder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workloadObjs...).WithInterceptorFuncs(opts.workloadFuncs)
+	if opts.workloadMapper != nil {
+		workloadBuilder = workloadBuilder.WithRESTMapper(opts.workloadMapper)
+	}
+	workload := workloadBuilder.Build()
 
 	cache := clustercache.NewFakeClusterCache(workload, clusterKey)
 	if opts.disconnected {
@@ -214,11 +230,17 @@ func (f *fixture) reconcile(t *testing.T) ctrl.Result {
 	return res
 }
 
+// events drains the Events recorded so far, except SignalSourceSelected
+// ones, which it keeps in sourceEvents.
 func (f *fixture) events() []string {
 	var out []string
 	for {
 		select {
 		case e := <-f.recorder.Events:
+			if strings.Contains(e, " "+EventSignalSourceSelected+" ") {
+				f.sourceEvents = append(f.sourceEvents, e)
+				continue
+			}
 			out = append(out, e)
 		default:
 			return out
@@ -894,7 +916,7 @@ func TestReconcileReleasesARestartOnceTheSignalClears(t *testing.T) {
 		t.Fatal("action annotation left behind")
 	}
 	assertEvents(t, f.events(),
-		"Normal RemediationReleased Released from remediation: no signal on node gpu-w-1 calls for a restart or a replacement any more")
+		"Normal RemediationReleased Released from remediation: no NodeCondition signal this operator acts on calls for a restart or a replacement of node gpu-w-1 any more")
 
 	assertPoll(t, f.reconcile(t))
 	assertEvents(t, f.events())
@@ -1085,6 +1107,190 @@ func TestReconcileRetriesAFailedRelease(t *testing.T) {
 	assertEvents(t, f.events(), "Normal RemediationReleased")
 }
 
+// pendingRequest builds an ExternalRemediationRequest the way NVSentinel's
+// janitor leaves it once it has released the node.
+func pendingRequest(name, node, check, action string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"healthEvent": map[string]any{
+			"nodeName": node, "checkName": check, "recommendedAction": action, "errorCode": []any{"79"},
+		}},
+		"status": map[string]any{"conditions": []any{
+			map[string]any{"type": extrr.ConditionOwnershipReleased, "status": "True"},
+			map[string]any{"type": extrr.ConditionComplete, "status": "Unknown"},
+		}},
+	}}
+	obj.SetGroupVersionKind(extrr.GroupVersionKind)
+	obj.SetName(name)
+
+	return obj
+}
+
+func TestReconcileReadsRequestsWhereTheyAreServed(t *testing.T) {
+	f := newFixture(t, fixtureOptions{
+		workloadMapper: newMapper(extrr.GroupVersionKind, janitorGroupVersionKind),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-2", "SysLogsNICDriverError", "REPLACE_VM")},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1"), newMachine("gpu-w-2", "gpu-w-2")},
+		// The janitor remediates this condition itself; it is not ours.
+		newNode("gpu-w-1", raised("GpuXidError", replaceMessage)),
+		newNode("gpu-w-2"))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("a node condition was acted on where requests are served")
+	}
+	m := f.machine(t, "gpu-w-2")
+	if !capi.IsMarkedForRemediation(m) {
+		t.Fatal("the request's Machine was not marked")
+	}
+	wantReason := "ExternalRemediationRequest SysLogsNICDriverError 79 (REPLACE_VM): REPLACE_VM maps to Replace; " +
+		"MachineHealthCheck gpu-workers remediates by replacement"
+	if got := m.Annotations[capi.RemediationReasonAnnotation]; got != wantReason {
+		t.Fatalf("reason annotation = %q, want %q", got, wantReason)
+	}
+	assertEvents(t, f.events(), "Warning MarkedForRemediation Marked for remediation: "+wantReason)
+	assertEvents(t, f.sourceEvents, "Normal SignalSourceSelected ExternalRemediationRequest: reading NVSentinel's ExternalRemediationRequests")
+}
+
+func TestReconcileOnlyReportsWhereTheJanitorRemediates(t *testing.T) {
+	f := newFixture(t, fixtureOptions{workloadMapper: newMapper(janitorGroupVersionKind)},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", replaceMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine marked where NVSentinel's janitor remediates")
+	}
+	assertEvents(t, f.events(), "Warning NodeHealthReported GpuXidError DCGM_FR_XID_ERROR gpu GPU-1234 (REPLACE_VM) on node gpu-w-1: "+
+		"REPLACE_VM maps to Replace; reported only since NVSentinel's janitor remediates this cluster itself")
+	assertEvents(t, f.sourceEvents, "Normal SignalSourceSelected ReportOnly")
+	if obs, _ := f.observed("gpu-w-1/GpuXidError"); obs.Decision != decision.Report {
+		t.Fatalf("observation = %+v, want a Report", obs)
+	}
+}
+
+func TestReconcileRecordsModeChangesOnce(t *testing.T) {
+	mapper := newMapper()
+	f := newFixture(t, fixtureOptions{workloadMapper: mapper},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, newNode("gpu-w-1"))
+
+	for range 2 {
+		assertPoll(t, f.reconcile(t))
+		f.events()
+	}
+	assertEvents(t, f.sourceEvents, "Normal SignalSourceSelected NodeCondition")
+
+	// NVSentinel is upgraded with its janitor: the next poll notices.
+	mapper.Add(extrr.GroupVersionKind, meta.RESTScopeRoot)
+	f.sourceEvents = nil
+	for range 2 {
+		assertPoll(t, f.reconcile(t))
+		f.events()
+	}
+	assertEvents(t, f.sourceEvents, "Normal SignalSourceSelected ExternalRemediationRequest")
+
+	// Forgetting the Cluster forgets its mode: selecting it again is news.
+	f.r.forget(clusterKey)
+	f.sourceEvents = nil
+	assertPoll(t, f.reconcile(t))
+	f.events()
+	assertEvents(t, f.sourceEvents, "Normal SignalSourceSelected ExternalRemediationRequest")
+}
+
+func TestReconcileDryRunRecordsNoModeEvent(t *testing.T) {
+	f := newFixture(t, fixtureOptions{dryRun: true},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, newNode("gpu-w-1"))
+
+	assertPoll(t, f.reconcile(t))
+	f.events()
+	assertEvents(t, f.sourceEvents)
+}
+
+func TestReconcileTreatsANewRequestAsNews(t *testing.T) {
+	first := pendingRequest("extrr-1", "gpu-w-1", "SysLogsNICDriverError", "REPLACE_VM")
+	f := newFixture(t, fixtureOptions{
+		uncovered:      true,
+		workloadMapper: newMapper(extrr.GroupVersionKind, janitorGroupVersionKind),
+		workloadObjs:   []client.Object{first},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, newNode("gpu-w-1"))
+
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events(), "Warning ReplaceUnavailable")
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events())
+
+	// The first request is answered, which releases NVSentinel's hold on
+	// the node, and NVSentinel raises the same fault again: the same node
+	// and check, but a new request and a new fault.
+	answered := first.DeepCopy()
+	_ = unstructured.SetNestedSlice(answered.Object, []any{
+		map[string]any{"type": extrr.ConditionOwnershipReleased, "status": "True"},
+		map[string]any{"type": extrr.ConditionComplete, "status": "True"},
+	}, "status", "conditions")
+	if err := f.workload.Update(context.Background(), answered); err != nil {
+		t.Fatalf("answer request: %v", err)
+	}
+	if err := f.workload.Create(context.Background(), pendingRequest("extrr-2", "gpu-w-1", "SysLogsNICDriverError", "REPLACE_VM")); err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events(), "Warning ReplaceUnavailable")
+	if obs, _ := f.observed("gpu-w-1/SysLogsNICDriverError"); obs.Request != "extrr-2" {
+		t.Fatalf("observation = %+v, want the new request", obs)
+	}
+}
+
+func TestReconcileReportsRestartsReadFromRequests(t *testing.T) {
+	// Until requests are answered, a Machine marked for a restart through
+	// one would never be released.
+	f := newFixture(t, fixtureOptions{
+		healthChecks:   []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)},
+		workloadMapper: newMapper(extrr.GroupVersionKind, janitorGroupVersionKind),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "RESTART_BM")},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, newNode("gpu-w-1"))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("a restart read from a request marked the Machine")
+	}
+	assertEvents(t, f.events(), "Warning NodeHealthReported SysLogsXIDError 79 (RESTART_BM) on node gpu-w-1: RESTART_BM maps to Restart; "+
+		"reported only since answering ExternalRemediationRequests, which releasing a restarted Machine depends on, is not implemented yet")
+}
+
+func TestReconcileStartsOverWhenTheModeChanges(t *testing.T) {
+	mapper := newMapper()
+	f := newFixture(t, fixtureOptions{workloadMapper: mapper},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuThermal", reportMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if _, ok := f.observed("gpu-w-1/GpuThermal"); !ok {
+		t.Fatal("signal not remembered")
+	}
+
+	// The janitor arrives with requests: the condition is no longer this
+	// operator's, and what was concluded about it is dropped rather than
+	// reported as cleared. noteMode is called directly because the end of
+	// a reconcile replaces what was concluded anyway, hiding the drop.
+	f.r.noteMode(ctrl.Log, newCluster(), ModeExternalRemediationRequest)
+	if _, ok := f.observed("gpu-w-1/GpuThermal"); ok {
+		t.Fatal("observations of the old mode kept")
+	}
+}
+
+func TestReconcileRetriesWhenTheSourceCannotBeSelected(t *testing.T) {
+	boom := errors.New("discovery unavailable")
+	f := newFixture(t, fixtureOptions{workloadMapper: failingMapper{RESTMapper: newMapper(), group: extrr.GroupVersionKind.Group, err: boom}},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")},
+		newNode("gpu-w-1", raised("GpuXidError", replaceMessage)))
+
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine marked although the source could not be selected")
+	}
+	assertEvents(t, f.events())
+	assertEvents(t, f.sourceEvents)
+}
+
 // failingCache is a ClusterCache whose reader fails for a reason other than
 // a missing connection.
 type failingCache struct {
@@ -1092,7 +1298,7 @@ type failingCache struct {
 	err error
 }
 
-func (c failingCache) GetReader(context.Context, client.ObjectKey) (client.Reader, error) {
+func (c failingCache) GetClient(context.Context, client.ObjectKey) (client.Client, error) {
 	return nil, c.err
 }
 

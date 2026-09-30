@@ -13,33 +13,47 @@ contracts every infrastructure provider already implements.
 ## Status
 
 The manager runs in a management cluster and, in its default dry-run mode,
-logs the decision it would take for every NVSentinel node condition found in
-the workload clusters. With `--dry-run=false` it asks Cluster API to remediate
-the Machines whose signal maps to a replacement or, where the cluster's
-MachineHealthChecks remediate through a template, to a restart, and records
-what it did as Events on them. A Machine marked for a restart is released
-again once its signal clears. The `ExternalRemediationRequest` source is not
-implemented yet. The design below describes the whole of what is being built.
+logs the decision it would take for every NVSentinel signal found in the
+workload clusters: `ExternalRemediationRequest` objects where the cluster
+serves them, node conditions otherwise. With `--dry-run=false` it asks
+Cluster API to remediate the Machines whose signal maps to a replacement or,
+where the cluster's MachineHealthChecks remediate through a template, to a
+restart, and records what it did as Events on them. A Machine marked for a
+restart is released again once its signal clears. Answering the
+`ExternalRemediationRequest` with the outcome is not implemented yet, and
+until it is, a restart read from a request is only reported, since nothing
+would release the Machine afterwards. The design below describes the whole
+of what is being built.
 
 ## Design
 
 1. **Read.** The operator runs in the management cluster and reaches every
-   workload cluster through the kubeconfig Cluster API maintains for it. In each cluster it reads
-   NVSentinel's signals from one of two sources, chosen per cluster by what the
-   cluster serves:
+   workload cluster through the kubeconfig Cluster API maintains for it. In
+   each cluster it reads NVSentinel's signals from one of two sources, chosen
+   on every poll by what the cluster serves:
    - `ExternalRemediationRequest` objects, NVSentinel's protocol for handing a
      node to an external remediation system. They carry the full health event,
      mark the node as released by NVSentinel, and take a completion status back.
-     Preferred whenever the CRD is present.
+     The resource ships with NVSentinel's janitor, which remediates by itself
+     every recommended action not routed to a request, so where it is served
+     the requests are the only source and node conditions are left alone.
    - Node conditions published by NVSentinel's Kubernetes platform connector,
      whose message carries `ErrorCode:…`, `GPU_UUID:…` and
      `Recommended Action=…`. Used when a cluster runs NVSentinel in
      detection-only mode. Messages that hit the connector's length limit are
      flagged, since those have lost trailing events.
 
-   A cluster where NVSentinel performs its own remediation, and no
-   `ExternalRemediationRequest` is routed to this operator, is observed but not
-   acted on, so that two systems never remediate the same node.
+   A cluster with the janitor but without `ExternalRemediationRequest`, as in
+   NVSentinel v0.5 to v1.9, is observed but not acted on, so that two systems
+   never remediate the same node. With NVSentinel v1.10 to v1.13 the resource
+   is served but the janitor never releases a node to a request, so nothing
+   there is reported either. The source chosen for a cluster is recorded
+   as an Event on the Cluster when it is first chosen after the operator
+   starts and whenever it changes, except in dry run. A resource installed
+   later is noticed on the next poll; a CRD that is removed is only noticed
+   once the operator reconnects to the cluster, and the CRDs Helm leaves
+   behind when NVSentinel's janitor is disabled keep the cluster in the mode
+   they imply.
 2. **Decode.** The recommended actions, error codes and GPU UUIDs are recovered
    from the signal.
 3. **Decide.** The actions are reduced to one platform decision. When a message
