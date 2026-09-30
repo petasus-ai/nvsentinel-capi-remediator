@@ -19,11 +19,9 @@ serves them, node conditions otherwise. With `--dry-run=false` it asks
 Cluster API to remediate the Machines whose signal maps to a replacement or,
 where the cluster's MachineHealthChecks remediate through a template, to a
 restart, and records what it did as Events on them. A Machine marked for a
-restart is released again once its signal clears. Answering the
-`ExternalRemediationRequest` with the outcome is not implemented yet, and
-until it is, a restart read from a request is only reported, since nothing
-would release the Machine afterwards. The design below describes the whole
-of what is being built.
+restart is released again once the restart is over, and a request is
+answered with the outcome. The design below describes the whole of what is
+being built.
 
 ## Design
 
@@ -61,7 +59,18 @@ of what is being built.
 4. **Act.** The node is mapped back to its `Machine` through `status.nodeRef`
    and the decision is expressed with Cluster API primitives only. When the
    signal came from an `ExternalRemediationRequest`, the outcome is written back
-   to it so NVSentinel can take the node back.
+   to its `ExternalRemediationComplete` condition: `True` once a restart is
+   over, which hands the node back to NVSentinel, and `False` straight away
+   when the operator will not act, because the decision is to report, no
+   Machine owns the node, it belongs to the control plane, it opted out of
+   remediation, or no MachineHealthCheck can carry out the decision, not even
+   once the paused ones are unpaused. A replacement is not answered: the node
+   is deleted with its Machine, and Kubernetes deletes the request with it,
+   since NVSentinel makes the node its owner. A request waits while its
+   Machine is paused or already being remediated, and while the checks that
+   could act on it are paused. Requests are read again from the API server
+   before anything is done about them, so one answered a moment ago is never
+   acted on twice.
 
 | NVSentinel recommended action | Decision | Cluster API action |
 |---|---|---|
@@ -87,11 +96,15 @@ that every infrastructure provider already speaks:
   Marking the Machine leaves the request, its lifecycle and the check's
   unhealthy-count limits with Cluster API. Cluster API never removes the
   annotation, so the operator removes the ones it set for a restart once
-  NVSentinel lowers the signal, which it does after a reboot or once its
-  check passes again. Until then the Machine stays unhealthy and a provider
-  that gives up on restarting it has it replaced. A replacement called for
-  while the restart is pending turns the mark into a replacement mark, which
-  is never removed.
+  the restart is over. For a node condition that is when NVSentinel lowers
+  it, which it does after a reboot or once its check passes again. A node
+  released to an `ExternalRemediationRequest` is no longer watched by
+  NVSentinel, so there a new boot ID on a Ready node ends the restart: the
+  operator records the node's boot ID with every restart mark, answers the
+  request once the node reports another, and then removes the mark. Until
+  then the Machine stays unhealthy and a provider that gives up on
+  restarting it has it replaced. A replacement called for while the restart
+  is pending turns the mark into a replacement mark, which is never removed.
 
 A Machine that no MachineHealthCheck selects, or only paused ones, is not
 marked, since the annotation would do nothing, or act at some arbitrary time
@@ -128,10 +141,13 @@ Done: signal decoder and decision table with tests built from real
 NVSentinel messages; the controller with workload cluster polling, Machine
 mapping and the replacement path, dry-run by default; the container image and
 kustomize deployment; restarts through the MachineHealthChecks' remediation
-templates, released again once the signal clears, with a configurable
-fallback for restarts no template can carry out.
-- `ExternalRemediationRequest` source, chosen per cluster, with the
-  completion status reported back to NVSentinel.
+templates, released again once the restart is over, with a configurable
+fallback for restarts no template can carry out; the
+`ExternalRemediationRequest` source, chosen per cluster, with the outcome
+reported back to NVSentinel.
+
+Next:
+
 - Configurable decision table, Helm chart, integration tests.
 - A release workflow that publishes the image.
 

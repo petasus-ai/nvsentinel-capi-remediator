@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
@@ -69,7 +70,7 @@ func TestMarkThenReleaseRoundTrips(t *testing.T) {
 	})
 	a, rec := newActuator(t, m)
 
-	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason); err != nil {
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, ""); err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
 	<-rec.Events
@@ -234,4 +235,82 @@ func TestEscalateReportsPatchFailure(t *testing.T) {
 		t.Fatal("in-memory Machine changed although the patch failed")
 	}
 	assertNoEvent(t, rec)
+}
+
+func TestMarkRecordsTheBootIDAndReleaseRemovesIt(t *testing.T) {
+	m := newMachine("w")
+	a, rec := newActuator(t, m)
+
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, "boot-1"); err != nil {
+		t.Fatalf("MarkForRemediation: %v", err)
+	}
+	if got := stored(t, a.Client, m).Annotations[RemediationBootIDAnnotation]; got != "boot-1" {
+		t.Fatalf("recorded boot ID = %q, want boot-1", got)
+	}
+	<-rec.Events
+
+	if _, err := a.Release(context.Background(), m, releaseReason); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if _, ok := stored(t, a.Client, m).Annotations[RemediationBootIDAnnotation]; ok {
+		t.Fatal("boot ID left behind")
+	}
+}
+
+func TestMarkWithoutBootIDRecordsNone(t *testing.T) {
+	m := newMachine("w")
+	a, _ := newActuator(t, m)
+
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, ""); err != nil {
+		t.Fatalf("MarkForRemediation: %v", err)
+	}
+	if _, ok := stored(t, a.Client, m).Annotations[RemediationBootIDAnnotation]; ok {
+		t.Fatal("empty boot ID recorded")
+	}
+}
+
+func TestRestartCompleted(t *testing.T) {
+	restarting := func(bootID string) func(*clusterv1.Machine) {
+		return func(m *clusterv1.Machine) {
+			markedBy(ActionRestart)(m)
+			if bootID != "" {
+				m.Annotations[RemediationBootIDAnnotation] = bootID
+			}
+		}
+	}
+	node := func(bootID string, ready corev1.ConditionStatus) *corev1.Node {
+		n := &corev1.Node{}
+		n.Status.NodeInfo.BootID = bootID
+		if ready != "" {
+			n.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: ready}}
+		}
+		return n
+	}
+
+	tests := []struct {
+		name    string
+		machine *clusterv1.Machine
+		node    *corev1.Node
+		want    bool
+	}{
+		{"restarted and Ready", newMachine("w", restarting("boot-1")), node("boot-2", corev1.ConditionTrue), true},
+		{"not restarted yet", newMachine("w", restarting("boot-1")), node("boot-1", corev1.ConditionTrue), false},
+		{"restarted, not Ready", newMachine("w", restarting("boot-1")), node("boot-2", corev1.ConditionFalse), false},
+		{"restarted, no Ready condition", newMachine("w", restarting("boot-1")), node("boot-2", ""), false},
+		{"no recorded boot ID", newMachine("w", restarting("")), node("boot-2", corev1.ConditionTrue), false},
+		{"node reports no boot ID", newMachine("w", restarting("boot-1")), node("", corev1.ConditionTrue), false},
+		{"no node", newMachine("w", restarting("boot-1")), nil, false},
+		// Only a restart this operator asked for completes this way.
+		{"marked for a replacement", newMachine("w", markedBy(ActionRemediate), func(m *clusterv1.Machine) {
+			m.Annotations[RemediationBootIDAnnotation] = "boot-1"
+		}), node("boot-2", corev1.ConditionTrue), false},
+		{"not marked", newMachine("w"), node("boot-2", corev1.ConditionTrue), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RestartCompleted(tt.machine, tt.node); got != tt.want {
+				t.Fatalf("RestartCompleted() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

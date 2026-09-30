@@ -221,3 +221,27 @@ func TestListHealthChecksReportsListFailure(t *testing.T) {
 		t.Fatalf("err = %v, want it to wrap %v and name the Cluster", err, boom)
 	}
 }
+
+func TestCoverageIgnoringPause(t *testing.T) {
+	cov := CoverageOf([]clusterv1.MachineHealthCheck{
+		newHealthCheck("reboot", withTemplate, pausedCheck),
+		newHealthCheck("replace", pausedCheck),
+	}, newMachine("w"))
+	if cov.Covered() {
+		t.Fatal("paused checks count as coverage")
+	}
+
+	unpaused := cov.IgnoringPause()
+	if !unpaused.Covered() || unpaused.TemplatesOnly() {
+		t.Fatalf("unpaused coverage = %+v, want covered with a check remediating by replacement", unpaused)
+	}
+	for _, check := range unpaused.Checks {
+		if check.Paused {
+			t.Fatalf("check %s still paused", check.Name)
+		}
+	}
+	// The original is left as it was.
+	if !cov.Checks[0].Paused || !cov.Checks[1].Paused {
+		t.Fatal("IgnoringPause changed the coverage it was called on")
+	}
+}

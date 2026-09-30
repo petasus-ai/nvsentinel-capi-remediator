@@ -46,6 +46,7 @@ import (
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/capi"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/decision"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/signal"
+	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/signal/extrr"
 )
 
 // ControllerName names the controller in logs, Events and the cluster cache.
@@ -71,6 +72,14 @@ const (
 	// is read in is first chosen or changes.
 	EventSignalSourceSelected = "SignalSourceSelected"
 
+	// ActionAnswer is the action of Events about answering an
+	// ExternalRemediationRequest.
+	ActionAnswer = "Answer"
+	// EventRequestAnswered is recorded on the Machine, or on the Cluster
+	// when the node has none, once an ExternalRemediationRequest is
+	// answered.
+	EventRequestAnswered = "ExternalRemediationRequestAnswered"
+
 	// EventNodeHealthReported is recorded on the Machine when a signal is
 	// reported and nothing is done about it.
 	EventNodeHealthReported = "NodeHealthReported"
@@ -86,6 +95,21 @@ const (
 	// EventMachineNotFound is recorded on the Cluster when a node with a
 	// signal has no Machine, so there is nothing to act on.
 	EventMachineNotFound = "MachineNotFound"
+)
+
+// Reasons given with an answer to an ExternalRemediationRequest, next to the
+// capi.SkipReason values for Machines this operator will not touch.
+const (
+	// AnswerRestarted: the node restarted and is Ready again.
+	AnswerRestarted = "Restarted"
+	// AnswerNotRemediated: the decision table reports the recommended
+	// action rather than acting on it.
+	AnswerNotRemediated = "NotRemediated"
+	// AnswerMachineNotFound: no Machine owns the node.
+	AnswerMachineNotFound = "MachineNotFound"
+	// AnswerRemediationUnavailable: no MachineHealthCheck can carry out
+	// what the decision asks for.
+	AnswerRemediationUnavailable = "RemediationUnavailable"
 )
 
 // RestartFallback is what happens to a restart that no remediation template
@@ -179,6 +203,34 @@ type observation struct {
 	// Fallback is the restart fallback applied, when a restart could not
 	// be carried out, with a note when the Cluster's override was invalid.
 	Fallback string
+	// Answer is what the ExternalRemediationRequest the signal came from
+	// is to be answered, if anything yet.
+	Answer answer
+}
+
+// answer is the outcome reported back to an ExternalRemediationRequest.
+// The zero value means there is nothing to report yet.
+type answer struct {
+	// Complete is true once the node is remediated, false when it will not
+	// be.
+	Complete bool
+	Reason   string
+	Message  string
+}
+
+// given reports whether there is an answer to report.
+func (a answer) given() bool {
+	return a.Reason != ""
+}
+
+// decline is the answer for a signal this operator will not act on: False
+// for a signal read from a request, nothing for any other.
+func decline(sig signal.Signal, reason, message string) answer {
+	if sig.Request == "" {
+		return answer{}
+	}
+
+	return answer{Complete: false, Reason: reason, Message: message}
 }
 
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
@@ -262,12 +314,57 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	nodes := map[string]*corev1.Node{}
+	if len(signals) > 0 {
+		if nodes, err = nodesByName(ctx, workload); err != nil {
+			log.Info("reading nodes failed, will retry", "error", err.Error())
+			return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
+		}
+	}
+
+	// Requests are acted on and answered through an uncached client: the
+	// cached view of the requests can lag behind that of the Machines, and
+	// a request answered a moment ago must not have its Machine marked
+	// again.
+	var live client.Client
+	if mode == ModeExternalRemediationRequest && len(signals) > 0 {
+		if live, err = r.ClusterCache.GetUncachedClient(ctx, req.NamespacedName); err != nil {
+			log.Info("reaching the workload cluster failed, will retry", "error", err.Error())
+			return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
+		}
+	}
+
 	previous := r.observations(req.NamespacedName)
 	current := make(map[string]observation, len(signals))
+	unreadable := false
 	for _, sig := range signals {
-		current[sig.Key()] = r.handle(ctx, cluster, mode, checks, sig, machines[sig.Node], previous[sig.Key()])
+		if sig.Request != "" {
+			pending, err := extrr.IsPending(ctx, live, sig.Request)
+			if err != nil {
+				log.Info("reading the request failed, will retry", "request", sig.Request, "error", err.Error())
+				unreadable = true
+				if prev, ok := previous[sig.Key()]; ok {
+					current[sig.Key()] = prev
+				}
+				continue
+			}
+			if !pending {
+				continue
+			}
+		}
+
+		machine, node := machines[sig.Node], nodes[sig.Node]
+		obs := r.handle(ctx, cluster, mode, checks, sig, machine, node, previous[sig.Key()])
+		if obs.Answer.given() {
+			r.answer(ctx, live, cluster, machine, sig, obs.Answer, obs != previous[sig.Key()])
+		}
+		current[sig.Key()] = obs
 	}
-	r.releaseRestarts(ctx, req.NamespacedName, source.Name(), machines, current)
+	// A request that could not be read may still hold its Machine, and
+	// nothing may be released on the strength of a partial read.
+	if !unreadable {
+		r.releaseRestarts(ctx, req.NamespacedName, source.Name(), machines, current)
+	}
 	r.remember(ctx, req.NamespacedName, previous, current)
 
 	return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
@@ -277,11 +374,12 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 // previous observation decides whether the signal is news: only news is
 // logged at the default level and recorded as an Event, so a fault that
 // persists across polls does not repeat itself. In ModeReportOnly every
-// decision is reported, whatever the table says, and so is a restart read
-// from an ExternalRemediationRequest (see reportOnly).
+// decision is reported, whatever the table says. For a signal read from an
+// ExternalRemediationRequest the observation also carries the answer to
+// give, once there is one.
 func (r *ClusterReconciler) handle(
 	ctx context.Context, cluster *clusterv1.Cluster, mode Mode, checks []clusterv1.MachineHealthCheck,
-	sig signal.Signal, machine *clusterv1.Machine, previous observation,
+	sig signal.Signal, machine *clusterv1.Machine, node *corev1.Node, previous observation,
 ) observation {
 	outcome := r.Table.Decide(sig)
 	if why := reportOnly(mode, outcome.Decision); why != "" {
@@ -314,14 +412,21 @@ func (r *ClusterReconciler) handle(
 	}
 
 	switch {
+	case node == nil && sig.Request != "":
+		// The node is gone, most likely replaced. NVSentinel makes the node
+		// the request's owner, so Kubernetes deletes the request with it:
+		// there is nobody left to answer.
+		log.V(1).Info("the request's node no longer exists, leaving the request to be deleted with it")
 	case machine == nil:
-		r.report(log, obs != previous, cluster, EventMachineNotFound, ActionReport,
-			fmt.Sprintf("node %s reports %s but no Machine owns it", sig.Node, describe(sig)))
+		message := fmt.Sprintf("node %s reports %s but no Machine owns it", sig.Node, describe(sig))
+		obs.Answer = decline(sig, AnswerMachineNotFound, message)
+		r.report(log, obs != previous, cluster, EventMachineNotFound, ActionReport, message)
 	case outcome.Decision == decision.Replace, outcome.Decision == decision.Restart:
-		return r.remediate(ctx, log, cluster, checks, sig, outcome, machine, obs, previous)
+		return r.remediate(ctx, log, cluster, checks, sig, outcome, machine, node, obs, previous)
 	default:
-		r.report(log, obs != previous, machine, EventNodeHealthReported, ActionReport,
-			fmt.Sprintf("%s on node %s: %s", describe(sig), sig.Node, outcome.Reason))
+		message := fmt.Sprintf("%s on node %s: %s", describe(sig), sig.Node, outcome.Reason)
+		obs.Answer = decline(sig, AnswerNotRemediated, message)
+		r.report(log, obs != previous, machine, EventNodeHealthReported, ActionReport, message)
 	}
 
 	return obs
@@ -337,12 +442,34 @@ func (r *ClusterReconciler) handle(
 // rather than unavailable.
 func (r *ClusterReconciler) remediate(
 	ctx context.Context, log logr.Logger, cluster *clusterv1.Cluster, checks []clusterv1.MachineHealthCheck,
-	sig signal.Signal, outcome decision.Outcome, machine *clusterv1.Machine, obs, previous observation,
+	sig signal.Signal, outcome decision.Outcome, machine *clusterv1.Machine, node *corev1.Node, obs, previous observation,
 ) observation {
 	restart := outcome.Decision == decision.Restart
 	action, verb := capi.ActionRemediate, "a replacement"
 	if restart {
 		action, verb = capi.ActionRestart, "a restart"
+	}
+
+	// NVSentinel stops watching a node it has released to a request, so
+	// the signal never clears by itself: a restart asked for through a
+	// request is complete once the node has restarted and is back. That is
+	// judged before anything else, so that a change of the checks during
+	// the restart does not turn a finished restart into a replacement. The
+	// Machine is released only once the request is answered (see answer),
+	// so that a failed answer never leaves a pending request behind an
+	// unmarked Machine, which the next poll would restart again.
+	//
+	// Completion is judged for the node, not for the request that asked
+	// for the restart: a request raised while the node was going down is
+	// answered by the same restart, as the node it concerns has restarted.
+	if restart && sig.Request != "" && capi.RestartCompleted(machine, node) {
+		obs.Answer = answer{Complete: true, Reason: AnswerRestarted,
+			Message: fmt.Sprintf("node %s restarted and is Ready", sig.Node)}
+		if obs != previous {
+			log.Info("restart completed")
+		}
+
+		return obs
 	}
 
 	// The checks decide what marking does, and so whether a restart can be
@@ -385,6 +512,12 @@ func (r *ClusterReconciler) remediate(
 
 	if skip := capi.Guard(machine); skip != "" {
 		obs.Skip = skip
+		if !skip.InProgress() && skip != capi.SkipPaused {
+			// Nobody is going to act on the Machine; a paused one is only
+			// waiting.
+			obs.Answer = decline(sig, string(skip), fmt.Sprintf("%s on node %s: remediation skipped because %s",
+				describe(sig), sig.Node, skip.Message()))
+		}
 		// The actuator drops Events for skips that mean remediation is
 		// under way, so recording news here cannot spam.
 		if obs != previous {
@@ -404,16 +537,27 @@ func (r *ClusterReconciler) remediate(
 		log = log.WithValues("restartFallback", obs.Fallback)
 	}
 
+	// A paused check may carry out the decision once it is unpaused, so a
+	// request waits for that instead of being declined for good.
+	unpaused := cov.IgnoringPause()
 	switch {
 	case restart && restartUnavailable:
-		r.report(log, obs != previous, machine, EventRestartUnavailable, capi.ActionRestart,
-			fmt.Sprintf("%s calls for a restart of node %s, but %s; reported only (restart fallback %s)",
-				describe(sig), sig.Node, obs.Coverage, obs.Fallback))
+		waiting := unpaused.TemplatesOnly() || (fallback == RestartFallbackReplace && unpaused.Covered())
+		message := fmt.Sprintf("%s calls for a restart of node %s, but %s; %s (restart fallback %s)",
+			describe(sig), sig.Node, obs.Coverage, unavailable(waiting), obs.Fallback)
+		if !waiting {
+			obs.Answer = decline(sig, AnswerRemediationUnavailable, message)
+		}
+		r.report(log, obs != previous, machine, EventRestartUnavailable, capi.ActionRestart, message)
 		return obs
 	case !restart && !cov.Covered():
-		r.report(log, obs != previous, machine, EventReplaceUnavailable, capi.ActionRemediate,
-			fmt.Sprintf("%s calls for a replacement of node %s, but %s; reported only",
-				describe(sig), sig.Node, obs.Coverage))
+		waiting := unpaused.Covered()
+		message := fmt.Sprintf("%s calls for a replacement of node %s, but %s; %s",
+			describe(sig), sig.Node, obs.Coverage, unavailable(waiting))
+		if !waiting {
+			obs.Answer = decline(sig, AnswerRemediationUnavailable, message)
+		}
+		r.report(log, obs != previous, machine, EventReplaceUnavailable, capi.ActionRemediate, message)
 		return obs
 	}
 
@@ -428,9 +572,15 @@ func (r *ClusterReconciler) remediate(
 		return obs
 	}
 
+	// The node's boot ID is recorded with a restart, which is how its
+	// completion is told when the request it came from never clears.
+	bootID := ""
+	if restart && node != nil {
+		bootID = node.Status.NodeInfo.BootID
+	}
 	// The actuator runs the same guards on the same object, so it cannot
 	// skip what passed them above.
-	if _, err := r.actuator().MarkForRemediation(ctx, machine, action, reason); err != nil {
+	if _, err := r.actuator().MarkForRemediation(ctx, machine, action, reason, bootID); err != nil {
 		log.Error(err, "marking Machine for remediation failed")
 		// Nothing was concluded; the next poll starts over.
 		return observation{}
@@ -529,24 +679,90 @@ func (r *ClusterReconciler) releaseRestarts(
 	}
 }
 
+// unavailable ends the message about a decision no MachineHealthCheck can
+// carry out: it is reported only, or, when unpausing checks would make it
+// possible, waits for that.
+func unavailable(waiting bool) string {
+	if waiting {
+		return "waiting for the paused checks"
+	}
+
+	return "reported only"
+}
+
 // reportOnly returns why a decision taken in the mode is only reported, or
 // the empty string when it may be acted on.
-//
-// A restart asked for through an ExternalRemediationRequest is reported
-// for now: the request stays pending until it is answered, which this
-// operator does not do yet, so a Machine marked for the restart would never
-// be released and its provider would give up and have it replaced.
 func reportOnly(mode Mode, d decision.Decision) string {
-	switch {
-	case d == decision.Report:
-		return ""
-	case mode == ModeReportOnly:
+	if mode == ModeReportOnly && d != decision.Report {
 		return "NVSentinel's janitor remediates this cluster itself"
-	case mode == ModeExternalRemediationRequest && d == decision.Restart:
-		return "answering ExternalRemediationRequests, which releasing a restarted Machine depends on, is not implemented yet"
-	default:
-		return ""
 	}
+
+	return ""
+}
+
+// answer reports the outcome of a signal back to the ExternalRemediationRequest
+// it came from, and once a completed restart is reported releases the
+// Machine from remediation. It logs and records an Event only when the
+// answer is written, which happens once: an answered request is no longer
+// pending. A failure is logged and the next poll answers again; a release
+// that fails after the answer is left to releaseRestarts, since the request
+// no longer holds the Machine. In dry run it only says, once, what it would
+// answer.
+func (r *ClusterReconciler) answer(
+	ctx context.Context, live client.Client, cluster *clusterv1.Cluster, machine *clusterv1.Machine,
+	sig signal.Signal, a answer, news bool,
+) {
+	log := ctrl.LoggerFrom(ctx).WithValues("node", sig.Node, "request", sig.Request,
+		"complete", a.Complete, "answerReason", a.Reason, "dryRun", r.DryRun)
+
+	if r.DryRun {
+		if news {
+			log.Info("would answer ExternalRemediationRequest", "answerMessage", a.Message)
+		}
+		return
+	}
+
+	answered, err := extrr.Answer(ctx, live, sig.Request, a.Complete, a.Reason, a.Message)
+	switch {
+	case err != nil:
+		log.Error(err, "answering ExternalRemediationRequest failed")
+		return
+	case !answered:
+		return
+	}
+
+	log.Info("ExternalRemediationRequest answered", "answerMessage", a.Message)
+	var object client.Object = cluster
+	if machine != nil {
+		object = machine
+	}
+	status := "False"
+	if a.Complete {
+		status = "True"
+	}
+	r.Recorder.Eventf(object, nil, corev1.EventTypeNormal, EventRequestAnswered, ActionAnswer, "%s",
+		capi.EventNote(fmt.Sprintf("Answered %s %s: %s, %s: %s", extrr.GroupVersionKind.Kind, sig.Request, status, a.Reason, a.Message)))
+
+	if a.Complete && machine != nil {
+		if _, err := r.actuator().Release(ctx, machine, a.Message); err != nil {
+			log.Error(err, "releasing Machine from remediation failed")
+		}
+	}
+}
+
+// nodesByName indexes the workload cluster's nodes by name.
+func nodesByName(ctx context.Context, reader client.Reader) (map[string]*corev1.Node, error) {
+	list := &corev1.NodeList{}
+	if err := reader.List(ctx, list); err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+
+	byName := make(map[string]*corev1.Node, len(list.Items))
+	for i := range list.Items {
+		byName[list.Items[i].Name] = &list.Items[i]
+	}
+
+	return byName, nil
 }
 
 // report logs a conclusion that involves no action and, when it is news and

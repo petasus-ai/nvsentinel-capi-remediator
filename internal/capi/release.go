@@ -67,6 +67,7 @@ func (a *Actuator) Release(ctx context.Context, m *clusterv1.Machine, reason str
 	delete(updated.Annotations, clusterv1.RemediateMachineAnnotation)
 	delete(updated.Annotations, RemediationReasonAnnotation)
 	delete(updated.Annotations, RemediationActionAnnotation)
+	delete(updated.Annotations, RemediationBootIDAnnotation)
 
 	// The resource version makes the patch fail rather than remove an
 	// annotation someone else set again after the Machine was read.
@@ -79,6 +80,31 @@ func (a *Actuator) Release(ctx context.Context, m *clusterv1.Machine, reason str
 		"%s", EventNote("Released from remediation: "+reason))
 
 	return true, nil
+}
+
+// RestartCompleted reports whether the node behind a Machine this operator
+// marked for a restart has restarted since and is back: it reports another
+// boot ID than the one recorded with the mark, and it is Ready. A mark
+// without a recorded boot ID, or a node that reports none, never counts as
+// restarted, since a restart could not be told apart.
+func RestartCompleted(m *clusterv1.Machine, node *corev1.Node) bool {
+	if action, ok := MarkedAction(m); !ok || action != ActionRestart || node == nil {
+		return false
+	}
+
+	recorded := m.Annotations[RemediationBootIDAnnotation]
+	current := node.Status.NodeInfo.BootID
+	if recorded == "" || current == "" || current == recorded {
+		return false
+	}
+
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
 }
 
 // Escalate turns this operator's restart mark into a replacement mark, so

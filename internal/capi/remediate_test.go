@@ -104,7 +104,7 @@ func TestMarkForRemediationStampsAnnotationsAndRecordsEvent(t *testing.T) {
 	})
 	a, rec := newActuator(t, m)
 
-	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason)
+	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, "")
 	if err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestMarkForRemediationWithoutExistingAnnotations(t *testing.T) {
 	m := newMachine("w")
 	a, _ := newActuator(t, m)
 
-	if skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason); err != nil || skip != "" {
+	if skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, ""); err != nil || skip != "" {
 		t.Fatalf("MarkForRemediation = %q, %v", skip, err)
 	}
 	if !IsMarkedForRemediation(stored(t, a.Client, m)) {
@@ -164,7 +164,7 @@ func TestMarkForRemediationSendsOnlyTheAnnotations(t *testing.T) {
 		}).Build()
 	a := &Actuator{Client: c, Recorder: events.NewFakeRecorder(1)}
 
-	if skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason); err != nil || skip != "" {
+	if skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, ""); err != nil || skip != "" {
 		t.Fatalf("MarkForRemediation = %q, %v", skip, err)
 	}
 
@@ -191,13 +191,13 @@ func TestMarkForRemediationDoesNotRestampAMarkedMachine(t *testing.T) {
 	m := newMachine("w")
 	a, rec := newActuator(t, m)
 
-	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason); err != nil {
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, ""); err != nil {
 		t.Fatalf("first MarkForRemediation: %v", err)
 	}
 	<-rec.Events
 	before := stored(t, a.Client, m)
 
-	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, "a later, different reason")
+	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, "a later, different reason", "")
 	if err != nil {
 		t.Fatalf("second MarkForRemediation: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestMarkForRemediationLeavesGuardedMachinesAlone(t *testing.T) {
 			a, rec := newActuator(t, m)
 			before := stored(t, a.Client, m)
 
-			skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason)
+			skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, "")
 			if err != nil {
 				t.Fatalf("MarkForRemediation: %v", err)
 			}
@@ -258,7 +258,7 @@ func TestMarkForRemediationDryRunWritesNothing(t *testing.T) {
 	a.DryRun = true
 	before := stored(t, a.Client, m)
 
-	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason)
+	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, "")
 	if err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestMarkForRemediationDryRunWritesNothing(t *testing.T) {
 	assertNoEvent(t, rec)
 
 	// The guards still apply, so a dry run explains what a live run would skip.
-	if skip, _ := a.MarkForRemediation(context.Background(), newMachine("cp", controlPlane), ActionRemediate, testReason); skip != SkipControlPlane {
+	if skip, _ := a.MarkForRemediation(context.Background(), newMachine("cp", controlPlane), ActionRemediate, testReason, ""); skip != SkipControlPlane {
 		t.Fatalf("dry run on a control plane Machine = %q, want %q", skip, SkipControlPlane)
 	}
 	assertNoEvent(t, rec)
@@ -285,7 +285,7 @@ func TestMarkForRemediationReportsPatchFailure(t *testing.T) {
 	m := newMachine("gone")
 	a, rec := newActuator(t)
 
-	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason)
+	skip, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, "")
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("err = %v, want NotFound", err)
 	}
@@ -319,7 +319,7 @@ func TestMarkForRemediationRecordsTheCallersAction(t *testing.T) {
 		rec := &actionRecorder{}
 		a.Recorder = rec
 
-		if _, err := a.MarkForRemediation(context.Background(), m, action, testReason); err != nil {
+		if _, err := a.MarkForRemediation(context.Background(), m, action, testReason, ""); err != nil {
 			t.Fatalf("MarkForRemediation: %v", err)
 		}
 		if !reflect.DeepEqual(rec.actions, []string{action}) {
@@ -346,7 +346,7 @@ func TestMarkForRemediationKeepsEventNotesWithinTheLimit(t *testing.T) {
 	m := newMachine("w")
 	a, rec := newActuator(t, m)
 
-	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, strings.Repeat("x", 2*EventNoteLimit)); err != nil {
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, strings.Repeat("x", 2*EventNoteLimit), ""); err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
 	e := <-rec.Events

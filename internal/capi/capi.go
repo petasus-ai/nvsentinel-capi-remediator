@@ -50,8 +50,13 @@ const (
 	// RemediationActionAnnotation records the action this operator asked
 	// for when it marked a Machine, Remediate or Restart. It is the proof
 	// that the remediate-machine annotation is this operator's to remove:
-	// a Machine marked for a restart is released once its signal clears.
+	// a Machine marked for a restart is released once the restart is over.
 	RemediationActionAnnotation = AnnotationPrefix + "/remediation-action"
+
+	// RemediationBootIDAnnotation records the boot ID the Machine's node
+	// reported when this operator asked for a restart. The restart has
+	// happened once the node reports another one.
+	RemediationBootIDAnnotation = AnnotationPrefix + "/remediation-boot-id"
 )
 
 // Event reasons recorded on Machines. Annotations die with the Machine and

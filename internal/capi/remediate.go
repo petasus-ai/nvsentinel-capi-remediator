@@ -27,9 +27,12 @@ import (
 
 // MarkForRemediation hands the Machine to Cluster API by stamping the
 // remediate-machine annotation, with the reason recorded next to it and in
-// an Event. What follows is decided by the MachineHealthCheck covering the
-// Machine (see the package documentation), subject to its own gates such as
-// maxUnhealthy. It returns the SkipReason when a guard left the Machine
+// an Event. What follows is decided by the MachineHealthChecks covering the
+// Machine (see Coverage), subject to their own gates such as maxUnhealthy.
+// The action names what the caller expects of it, Remediate or Restart, and
+// is recorded with the mark. The boot ID of the Machine's node, when given,
+// is recorded too, so that a restart can later be told apart (see
+// RestartCompleted). It returns the SkipReason when a guard left the Machine
 // untouched, and the zero value once the annotation is in place or, in dry
 // run, would have been. The Machine is updated in place only when the patch
 // succeeded.
@@ -37,7 +40,7 @@ import (
 // Cluster API's own event for this names the MachineHealthCheck that acted,
 // not the fault, and the annotations disappear with the Machine moments
 // later. The Event recorded here is what an operator still has afterwards.
-func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine, action, reason string) (SkipReason, error) {
+func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine, action, reason, bootID string) (SkipReason, error) {
 	if skip := Guard(m); skip != "" {
 		return skip, nil
 	}
@@ -53,6 +56,9 @@ func (a *Actuator) MarkForRemediation(ctx context.Context, m *clusterv1.Machine,
 	updated.Annotations[clusterv1.RemediateMachineAnnotation] = ""
 	updated.Annotations[RemediationReasonAnnotation] = reason
 	updated.Annotations[RemediationActionAnnotation] = action
+	if bootID != "" {
+		updated.Annotations[RemediationBootIDAnnotation] = bootID
+	}
 
 	if err := a.Client.Patch(ctx, updated, client.MergeFrom(m)); err != nil {
 		return "", fmt.Errorf("patch machine %s/%s: %w", m.Namespace, m.Name, err)

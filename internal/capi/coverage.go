@@ -99,6 +99,19 @@ func (c Coverage) TemplatesOnly() bool {
 	return true
 }
 
+// IgnoringPause returns the coverage as it will be once every paused check
+// is unpaused, which tells whether a decision the checks cannot carry out
+// now will become possible or never will.
+func (c Coverage) IgnoringPause() Coverage {
+	unpaused := Coverage{Checks: make([]CoveringCheck, len(c.Checks))}
+	for i, check := range c.Checks {
+		check.Paused = false
+		unpaused.Checks[i] = check
+	}
+
+	return unpaused
+}
+
 // Describe explains the coverage in a clause, for logs and Events, e.g.
 // "MachineHealthCheck gpu-np remediates through RebootRemediationTemplate
 // reboot".

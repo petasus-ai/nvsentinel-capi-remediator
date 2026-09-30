@@ -24,11 +24,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -189,7 +191,14 @@ func newFixture(t *testing.T, opts fixtureOptions, hubObjs []client.Object, node
 	for _, n := range nodes {
 		workloadObjs = append(workloadObjs, n)
 	}
-	workloadBuilder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workloadObjs...).WithInterceptorFuncs(opts.workloadFuncs)
+	var requests []client.Object
+	for _, o := range opts.workloadObjs {
+		if _, ok := o.(*unstructured.Unstructured); ok {
+			requests = append(requests, o)
+		}
+	}
+	workloadBuilder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workloadObjs...).
+		WithStatusSubresource(requests...).WithInterceptorFuncs(opts.workloadFuncs)
 	if opts.workloadMapper != nil {
 		workloadBuilder = workloadBuilder.WithRESTMapper(opts.workloadMapper)
 	}
@@ -676,7 +685,7 @@ func TestReconcileReportsReplacementsWhileTheHealthCheckIsPaused(t *testing.T) {
 		t.Fatal("Machine marked while its only MachineHealthCheck is paused")
 	}
 	assertEvents(t, f.events(), "Warning ReplaceUnavailable GpuXidError DCGM_FR_XID_ERROR gpu GPU-1234 (REPLACE_VM) "+
-		"calls for a replacement of node gpu-w-1, but MachineHealthCheck gpu-workers remediates by replacement (paused); reported only")
+		"calls for a replacement of node gpu-w-1, but MachineHealthCheck gpu-workers remediates by replacement (paused); waiting for the paused checks")
 
 	assertPoll(t, f.reconcile(t))
 	assertEvents(t, f.events())
@@ -793,7 +802,7 @@ func TestReconcileRestartFallback(t *testing.T) {
 			newHealthCheck(defaultHealthCheck, func(mhc *clusterv1.MachineHealthCheck) {
 				mhc.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
 			}),
-		}}, false, "but MachineHealthCheck gpu-workers remediates by replacement (paused); reported only (restart fallback replace)"},
+		}}, false, "but MachineHealthCheck gpu-workers remediates by replacement (paused); waiting for the paused checks (restart fallback replace)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1209,51 +1218,412 @@ func TestReconcileTreatsANewRequestAsNews(t *testing.T) {
 	first := pendingRequest("extrr-1", "gpu-w-1", "SysLogsNICDriverError", "REPLACE_VM")
 	f := newFixture(t, fixtureOptions{
 		uncovered:      true,
-		workloadMapper: newMapper(extrr.GroupVersionKind, janitorGroupVersionKind),
+		workloadMapper: requestMode(),
 		workloadObjs:   []client.Object{first},
 	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, newNode("gpu-w-1"))
 
 	assertPoll(t, f.reconcile(t))
-	assertEvents(t, f.events(), "Warning ReplaceUnavailable")
+	assertEvents(t, f.events(), "Warning ReplaceUnavailable", "Normal ExternalRemediationRequestAnswered")
 	assertPoll(t, f.reconcile(t))
 	assertEvents(t, f.events())
 
-	// The first request is answered, which releases NVSentinel's hold on
-	// the node, and NVSentinel raises the same fault again: the same node
-	// and check, but a new request and a new fault.
-	answered := first.DeepCopy()
-	_ = unstructured.SetNestedSlice(answered.Object, []any{
-		map[string]any{"type": extrr.ConditionOwnershipReleased, "status": "True"},
-		map[string]any{"type": extrr.ConditionComplete, "status": "True"},
-	}, "status", "conditions")
-	if err := f.workload.Update(context.Background(), answered); err != nil {
-		t.Fatalf("answer request: %v", err)
+	// NVSentinel deletes the answered request once its time to live is
+	// up, which releases its hold on the node, and raises the same fault
+	// again: the same node and check, but a new request and a new fault.
+	if err := f.workload.Delete(context.Background(), first); err != nil {
+		t.Fatalf("delete request: %v", err)
 	}
 	if err := f.workload.Create(context.Background(), pendingRequest("extrr-2", "gpu-w-1", "SysLogsNICDriverError", "REPLACE_VM")); err != nil {
 		t.Fatalf("create request: %v", err)
 	}
 	assertPoll(t, f.reconcile(t))
-	assertEvents(t, f.events(), "Warning ReplaceUnavailable")
+	assertEvents(t, f.events(), "Warning ReplaceUnavailable", "Normal ExternalRemediationRequestAnswered")
 	if obs, _ := f.observed("gpu-w-1/SysLogsNICDriverError"); obs.Request != "extrr-2" {
 		t.Fatalf("observation = %+v, want the new request", obs)
 	}
 }
 
-func TestReconcileReportsRestartsReadFromRequests(t *testing.T) {
-	// Until requests are answered, a Machine marked for a restart through
-	// one would never be released.
+// booted gives the node a boot ID and makes it Ready.
+func booted(bootID string) func(*corev1.Node) {
+	return func(n *corev1.Node) {
+		n.Status.NodeInfo.BootID = bootID
+		n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionTrue})
+	}
+}
+
+func bootedNode(name, bootID string) *corev1.Node {
+	n := newNode(name)
+	booted(bootID)(n)
+	return n
+}
+
+// requestAnswer returns the status and reason of a request's answer.
+func (f *fixture) requestAnswer(t *testing.T, name string) (string, string) {
+	t.Helper()
+
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(extrr.GroupVersionKind)
+	if err := f.workload.Get(context.Background(), client.ObjectKey{Name: name}, obj); err != nil {
+		t.Fatalf("get request %s: %v", name, err)
+	}
+	conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	for _, c := range conditions {
+		if cond := c.(map[string]any); cond["type"] == extrr.ConditionComplete {
+			status, _ := cond["status"].(string)
+			reason, _ := cond["reason"].(string)
+			return status, reason
+		}
+	}
+
+	return "", ""
+}
+
+func requestMode() meta.RESTMapper {
+	return newMapper(extrr.GroupVersionKind, janitorGroupVersionKind)
+}
+
+func TestReconcileRestartsThroughARequestAndAnswersOnceBack(t *testing.T) {
+	node := bootedNode("gpu-w-1", "boot-1")
 	f := newFixture(t, fixtureOptions{
 		healthChecks:   []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)},
-		workloadMapper: newMapper(extrr.GroupVersionKind, janitorGroupVersionKind),
+		workloadMapper: requestMode(),
 		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "RESTART_BM")},
-	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, newNode("gpu-w-1"))
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, node)
+
+	assertPoll(t, f.reconcile(t))
+	m := f.machine(t, "gpu-w-1")
+	if action, _ := capi.MarkedAction(m); action != capi.ActionRestart {
+		t.Fatalf("MarkedAction = %q, want the Machine marked for a restart", action)
+	}
+	if got := m.Annotations[capi.RemediationBootIDAnnotation]; got != "boot-1" {
+		t.Fatalf("recorded boot ID = %q, want the node's", got)
+	}
+	assertEvents(t, f.events(), "Warning MarkedForRemediation")
+	if status, _ := f.requestAnswer(t, "extrr-1"); status != "Unknown" {
+		t.Fatalf("request answered %q while the restart is pending", status)
+	}
+
+	// Restarting: a new boot, not Ready yet. Nothing to say.
+	node.Status.NodeInfo.BootID = "boot-2"
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
+	if err := f.workload.Status().Update(context.Background(), node); err != nil {
+		t.Fatalf("update node: %v", err)
+	}
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events())
+	if status, _ := f.requestAnswer(t, "extrr-1"); status != "Unknown" {
+		t.Fatalf("request answered %q before the node is back", status)
+	}
+
+	// Back and Ready: the request is answered, then the Machine released.
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+	if err := f.workload.Status().Update(context.Background(), node); err != nil {
+		t.Fatalf("update node: %v", err)
+	}
+	assertPoll(t, f.reconcile(t))
+	if status, reason := f.requestAnswer(t, "extrr-1"); status != "True" || reason != AnswerRestarted {
+		t.Fatalf("answer = %s %s, want True %s", status, reason, AnswerRestarted)
+	}
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine still marked after its restart was answered")
+	}
+	assertEvents(t, f.events(),
+		"Normal ExternalRemediationRequestAnswered Answered ExternalRemediationRequest extrr-1: True, Restarted: node gpu-w-1 restarted and is Ready",
+		"Normal RemediationReleased Released from remediation: node gpu-w-1 restarted and is Ready")
+
+	// The answered request is no longer pending: nothing more happens.
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events())
+}
+
+func TestReconcileDeclinesRequestsItWillNotActOn(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    fixtureOptions
+		machine *clusterv1.Machine
+		action  string
+		reason  string
+		event   string
+	}{
+		{"reported action", fixtureOptions{}, newMachine("gpu-w-1", "gpu-w-1"), "CONTACT_SUPPORT",
+			AnswerNotRemediated, "Warning NodeHealthReported"},
+		{"no Machine", fixtureOptions{}, nil, "REPLACE_VM", AnswerMachineNotFound, "Warning MachineNotFound"},
+		{"control plane", fixtureOptions{}, newMachine("gpu-w-1", "gpu-w-1", controlPlane), "REPLACE_VM",
+			string(capi.SkipControlPlane), "Warning RemediationSkipped"},
+		{"opted out", fixtureOptions{}, newMachine("gpu-w-1", "gpu-w-1", optedOut), "REPLACE_VM",
+			string(capi.SkipOptedOut), "Warning RemediationSkipped"},
+		{"replacement without a health check", fixtureOptions{uncovered: true}, newMachine("gpu-w-1", "gpu-w-1"), "REPLACE_VM",
+			AnswerRemediationUnavailable, "Warning ReplaceUnavailable"},
+		{"restart without a template", fixtureOptions{}, newMachine("gpu-w-1", "gpu-w-1"), "RESTART_BM",
+			AnswerRemediationUnavailable, "Warning RestartUnavailable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := tt.opts
+			opts.workloadMapper = requestMode()
+			opts.workloadObjs = []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", tt.action)}
+			hubObjs := []client.Object{newCluster()}
+			if tt.machine != nil {
+				hubObjs = append(hubObjs, tt.machine)
+			}
+			f := newFixture(t, opts, hubObjs, bootedNode("gpu-w-1", "boot-1"))
+
+			assertPoll(t, f.reconcile(t))
+			if status, reason := f.requestAnswer(t, "extrr-1"); status != "False" || reason != tt.reason {
+				t.Fatalf("answer = %s %s, want False %s", status, reason, tt.reason)
+			}
+			if tt.machine != nil && capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+				t.Fatal("a declined request marked the Machine")
+			}
+			assertEvents(t, f.events(), tt.event, "Normal ExternalRemediationRequestAnswered Answered ExternalRemediationRequest extrr-1: False, "+tt.reason)
+
+			assertPoll(t, f.reconcile(t))
+			assertEvents(t, f.events())
+		})
+	}
+}
+
+func TestReconcileWaitsOnRequestsStillInProgress(t *testing.T) {
+	paused := func(m *clusterv1.Machine) { m.Annotations = map[string]string{clusterv1.PausedAnnotation: ""} }
+	tests := []struct {
+		name    string
+		machine *clusterv1.Machine
+		nodes   []*corev1.Node
+		action  string
+	}{
+		// A paused Machine is acted on once it is unpaused.
+		{"paused Machine", newMachine("gpu-w-1", "gpu-w-1", paused), []*corev1.Node{bootedNode("gpu-w-1", "boot-1")}, "REPLACE_VM"},
+		// Cluster API replaces the Machine and deletes the node, and the
+		// request with it.
+		{"replacement under way", newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRemediate)),
+			[]*corev1.Node{bootedNode("gpu-w-1", "boot-1")}, "REPLACE_VM"},
+		// The restart has not happened yet.
+		{"restart under way", newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart), func(m *clusterv1.Machine) {
+			m.Annotations[capi.RemediationBootIDAnnotation] = "boot-1"
+		}), []*corev1.Node{bootedNode("gpu-w-1", "boot-1")}, "RESTART_BM"},
+		// Replaced already: neither Machine nor node is left.
+		{"node gone", nil, nil, "REPLACE_VM"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hubObjs := []client.Object{newCluster()}
+			if tt.machine != nil {
+				hubObjs = append(hubObjs, tt.machine)
+			}
+			f := newFixture(t, fixtureOptions{
+				healthChecks:   []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)},
+				workloadMapper: requestMode(),
+				workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", tt.action)},
+			}, hubObjs, tt.nodes...)
+
+			for range 2 {
+				assertPoll(t, f.reconcile(t))
+				if status, _ := f.requestAnswer(t, "extrr-1"); status != "Unknown" {
+					t.Fatalf("request answered %q while remediation is in progress", status)
+				}
+			}
+			for _, e := range f.events() {
+				if strings.Contains(e, EventRequestAnswered) || strings.Contains(e, EventMachineNotFound) {
+					t.Fatalf("unexpected event %q", e)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcileDryRunAnswersNothing(t *testing.T) {
+	f := newFixture(t, fixtureOptions{
+		dryRun:         true,
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "CONTACT_SUPPORT")},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, bootedNode("gpu-w-1", "boot-1"))
+
+	assertPoll(t, f.reconcile(t))
+	if status, _ := f.requestAnswer(t, "extrr-1"); status != "Unknown" {
+		t.Fatalf("dry run answered %q", status)
+	}
+	assertEvents(t, f.events())
+	if obs, _ := f.observed("gpu-w-1/SysLogsXIDError"); obs.Answer.Complete || obs.Answer.Reason != AnswerNotRemediated {
+		t.Fatalf("observation = %+v, want the answer it would give", obs)
+	}
+}
+
+func TestReconcileRetriesAFailedAnswer(t *testing.T) {
+	failing := true
+	f := newFixture(t, fixtureOptions{
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "CONTACT_SUPPORT")},
+		workloadFuncs: interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if failing {
+					return errors.New("apiserver unavailable")
+				}
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, bootedNode("gpu-w-1", "boot-1"))
+
+	assertPoll(t, f.reconcile(t))
+	if status, _ := f.requestAnswer(t, "extrr-1"); status != "Unknown" {
+		t.Fatalf("answer written despite the failure: %q", status)
+	}
+	assertEvents(t, f.events(), "Warning NodeHealthReported")
+
+	failing = false
+	assertPoll(t, f.reconcile(t))
+	if status, _ := f.requestAnswer(t, "extrr-1"); status != "False" {
+		t.Fatalf("answer = %q, want the retry to answer False", status)
+	}
+	assertEvents(t, f.events(), "Normal ExternalRemediationRequestAnswered")
+}
+
+func TestReconcileRetriesWhenNodesCannotBeRead(t *testing.T) {
+	f := newFixture(t, fixtureOptions{
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "CONTACT_SUPPORT")},
+		workloadFuncs: interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*corev1.NodeList); ok {
+					return errors.New("apiserver unavailable")
+				}
+				return c.List(ctx, list, opts...)
+			},
+		},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, bootedNode("gpu-w-1", "boot-1"))
+
+	assertPoll(t, f.reconcile(t))
+	if status, _ := f.requestAnswer(t, "extrr-1"); status != "Unknown" {
+		t.Fatalf("request answered %q without its node", status)
+	}
+	assertEvents(t, f.events())
+}
+
+// requestReads returns interceptor functions that answer the n-th and
+// later reads of a request with the given error, as when the request goes
+// away in the middle of a poll.
+func requestReads(fromRead int, err error) interceptor.Funcs {
+	reads := 0
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*unstructured.Unstructured); ok {
+				reads++
+				if reads >= fromRead {
+					return err
+				}
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+
+func TestReconcileIgnoresRequestsNoLongerPending(t *testing.T) {
+	// The cached list still shows the request, but the API server no
+	// longer has it: nothing is done about it.
+	gone := apierrors.NewNotFound(schema.GroupResource{Group: extrr.GroupVersionKind.Group}, "extrr-1")
+	f := newFixture(t, fixtureOptions{
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "REPLACE_VM")},
+		workloadFuncs:  requestReads(1, gone),
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, bootedNode("gpu-w-1", "boot-1"))
 
 	assertPoll(t, f.reconcile(t))
 	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
-		t.Fatal("a restart read from a request marked the Machine")
+		t.Fatal("Machine marked for a request that is no longer pending")
 	}
-	assertEvents(t, f.events(), "Warning NodeHealthReported SysLogsXIDError 79 (RESTART_BM) on node gpu-w-1: RESTART_BM maps to Restart; "+
-		"reported only since answering ExternalRemediationRequests, which releasing a restarted Machine depends on, is not implemented yet")
+	assertEvents(t, f.events())
+	if _, ok := f.observed("gpu-w-1/SysLogsXIDError"); ok {
+		t.Fatal("a request no longer pending was remembered")
+	}
+}
+
+func TestReconcileKeepsWhatItKnewWhenARequestCannotBeRead(t *testing.T) {
+	f := newFixture(t, fixtureOptions{
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "CONTACT_SUPPORT")},
+		// In dry run a poll reads the request once, to check it is pending.
+		workloadFuncs: requestReads(2, errors.New("apiserver unavailable")),
+		dryRun:        true,
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, bootedNode("gpu-w-1", "boot-1"))
+
+	assertPoll(t, f.reconcile(t))
+	before, ok := f.observed("gpu-w-1/SysLogsXIDError")
+	if !ok {
+		t.Fatal("signal not remembered")
+	}
+
+	// The next read fails: the signal is neither handled nor forgotten.
+	assertPoll(t, f.reconcile(t))
+	if after, ok := f.observed("gpu-w-1/SysLogsXIDError"); !ok || after != before {
+		t.Fatalf("observation = %+v, %v; want it kept as %+v", after, ok, before)
+	}
+}
+
+func TestReconcileReleasesNothingWhenARequestCannotBeRead(t *testing.T) {
+	// First poll after a restart of the operator: nothing is remembered,
+	// and the request holding the Machine cannot be read. The restart under
+	// way must not be withdrawn.
+	f := newFixture(t, fixtureOptions{
+		healthChecks:   []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)},
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "RESTART_BM")},
+		workloadFuncs:  requestReads(1, errors.New("apiserver unavailable")),
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart), func(m *clusterv1.Machine) {
+		m.Annotations[capi.RemediationBootIDAnnotation] = "boot-1"
+	})}, bootedNode("gpu-w-1", "boot-1"))
+
+	assertPoll(t, f.reconcile(t))
+	if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRestart {
+		t.Fatalf("MarkedAction = %q, want the restart kept while its request cannot be read", action)
+	}
+	assertEvents(t, f.events())
+}
+
+func TestReconcileSaysNothingWhenTheRequestIsGoneBeforeTheAnswer(t *testing.T) {
+	// The request is pending when the poll checks it and gone when the
+	// answer reads it again: there is nobody left to answer.
+	gone := apierrors.NewNotFound(schema.GroupResource{Group: extrr.GroupVersionKind.Group}, "extrr-1")
+	f := newFixture(t, fixtureOptions{
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "CONTACT_SUPPORT")},
+		workloadFuncs:  requestReads(2, gone),
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, bootedNode("gpu-w-1", "boot-1"))
+
+	assertPoll(t, f.reconcile(t))
+	assertEvents(t, f.events(), "Warning NodeHealthReported")
+}
+
+func TestReconcileReleasesARestartWhoseReleaseFailedAfterTheAnswer(t *testing.T) {
+	failing := true
+	f := newFixture(t, fixtureOptions{
+		healthChecks:   []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)},
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "RESTART_BM")},
+		hubFuncs: interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if failing {
+					return errors.New("webhook denied the patch")
+				}
+				return c.Patch(ctx, obj, patch, opts...)
+			},
+		},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart), func(m *clusterv1.Machine) {
+		m.Annotations[capi.RemediationBootIDAnnotation] = "boot-1"
+	})}, bootedNode("gpu-w-1", "boot-2"))
+
+	assertPoll(t, f.reconcile(t))
+	if status, _ := f.requestAnswer(t, "extrr-1"); status != "True" {
+		t.Fatalf("answer = %q, want True", status)
+	}
+	if !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine released despite the failed patch")
+	}
+
+	// The answered request no longer holds the Machine.
+	failing = false
+	assertPoll(t, f.reconcile(t))
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine not released on the next poll")
+	}
 }
 
 func TestReconcileStartsOverWhenTheModeChanges(t *testing.T) {
@@ -1289,6 +1659,140 @@ func TestReconcileRetriesWhenTheSourceCannotBeSelected(t *testing.T) {
 	}
 	assertEvents(t, f.events())
 	assertEvents(t, f.sourceEvents)
+}
+
+func TestReconcileWaitsForPausedHealthChecks(t *testing.T) {
+	pausedCheck := func(mhc *clusterv1.MachineHealthCheck) {
+		mhc.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
+	}
+	tests := []struct {
+		name     string
+		checks   []*clusterv1.MachineHealthCheck
+		action   string
+		fallback RestartFallback
+		declined bool
+	}{
+		// Unpausing the check makes the decision possible: wait for it.
+		{"replacement", []*clusterv1.MachineHealthCheck{newHealthCheck("replace", pausedCheck)}, "REPLACE_VM", "", false},
+		{"restart", []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate, pausedCheck)}, "RESTART_BM", "", false},
+		{"restart falling back to a replacement", []*clusterv1.MachineHealthCheck{newHealthCheck("replace", pausedCheck)},
+			"RESTART_BM", RestartFallbackReplace, false},
+		// Unpausing it would not help: a check without a template replaces
+		// the Machine, which a restart must not do.
+		{"restart only a replacement could follow", []*clusterv1.MachineHealthCheck{newHealthCheck("replace", pausedCheck)},
+			"RESTART_BM", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{
+				healthChecks:    tt.checks,
+				restartFallback: tt.fallback,
+				workloadMapper:  requestMode(),
+				workloadObjs:    []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", tt.action)},
+			}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, bootedNode("gpu-w-1", "boot-1"))
+
+			assertPoll(t, f.reconcile(t))
+			status, _ := f.requestAnswer(t, "extrr-1")
+			if declined := status == "False"; declined != tt.declined {
+				t.Fatalf("answer = %q, want declined: %v", status, tt.declined)
+			}
+			if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+				t.Fatal("Machine marked while its only check is paused")
+			}
+		})
+	}
+}
+
+func TestReconcileAnswersAFailedRestartAnswerAgainWithoutRestarting(t *testing.T) {
+	failing := true
+	f := newFixture(t, fixtureOptions{
+		healthChecks:   []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)},
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "RESTART_BM")},
+		workloadFuncs: interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if failing {
+					return errors.New("apiserver unavailable")
+				}
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart), func(m *clusterv1.Machine) {
+		m.Annotations[capi.RemediationBootIDAnnotation] = "boot-1"
+	})}, bootedNode("gpu-w-1", "boot-2"))
+
+	// The restart is over but the answer fails: the Machine stays marked
+	// as it was, and is not marked again.
+	assertPoll(t, f.reconcile(t))
+	m := f.machine(t, "gpu-w-1")
+	if action, _ := capi.MarkedAction(m); action != capi.ActionRestart || m.Annotations[capi.RemediationBootIDAnnotation] != "boot-1" {
+		t.Fatalf("mark changed after a failed answer: %v", m.Annotations)
+	}
+	assertEvents(t, f.events())
+
+	failing = false
+	assertPoll(t, f.reconcile(t))
+	if status, reason := f.requestAnswer(t, "extrr-1"); status != "True" || reason != AnswerRestarted {
+		t.Fatalf("answer = %s %s, want True %s", status, reason, AnswerRestarted)
+	}
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+		t.Fatal("Machine still marked after the answer")
+	}
+	for _, e := range f.events() {
+		if strings.Contains(e, capi.EventMarkedForRemediation) {
+			t.Fatalf("Machine marked again: %q", e)
+		}
+	}
+}
+
+func TestReconcileKeepsARestartWhoseConditionPersistsAfterTheBoot(t *testing.T) {
+	// Node conditions are lowered by NVSentinel once the fault is gone. One
+	// that is still raised after the node restarted means the restart did
+	// not help: the Machine stays marked, and a restart is not asked for
+	// over and over.
+	node := bootedNode("gpu-w-1", "boot-2")
+	node.Status.Conditions = append(node.Status.Conditions, raised("GpuXidError", restartMessage))
+	f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart), func(m *clusterv1.Machine) {
+			m.Annotations[capi.RemediationBootIDAnnotation] = "boot-1"
+		})}, node)
+
+	for range 2 {
+		assertPoll(t, f.reconcile(t))
+		if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRestart {
+			t.Fatalf("MarkedAction = %q, want the restart mark kept", action)
+		}
+	}
+	for _, e := range f.events() {
+		if strings.Contains(e, capi.EventRemediationReleased) || strings.Contains(e, capi.EventMarkedForRemediation) {
+			t.Fatalf("unexpected event %q", e)
+		}
+	}
+}
+
+// uncachedFailingCache is a ClusterCache whose uncached client cannot be
+// had.
+type uncachedFailingCache struct {
+	clustercache.ClusterCache
+	err error
+}
+
+func (c uncachedFailingCache) GetUncachedClient(context.Context, client.ObjectKey) (client.Client, error) {
+	return nil, c.err
+}
+
+func TestReconcileRetriesWhenTheWorkloadClusterCannotBeReachedUncached(t *testing.T) {
+	f := newFixture(t, fixtureOptions{
+		workloadMapper: requestMode(),
+		workloadObjs:   []client.Object{pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "CONTACT_SUPPORT")},
+	}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1")}, bootedNode("gpu-w-1", "boot-1"))
+	f.r.ClusterCache = uncachedFailingCache{ClusterCache: f.r.ClusterCache, err: errors.New("unreachable")}
+
+	assertPoll(t, f.reconcile(t))
+	if status, _ := f.requestAnswer(t, "extrr-1"); status != "Unknown" {
+		t.Fatalf("request answered %q", status)
+	}
+	assertEvents(t, f.events())
 }
 
 // failingCache is a ClusterCache whose reader fails for a reason other than
