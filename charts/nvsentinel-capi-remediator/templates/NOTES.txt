@@ -1,0 +1,10 @@
+{{ include "nvsentinel-capi-remediator.fullname" . }} is installed in {{ .Release.Namespace }}.
+{{- if .Values.dryRun }}
+
+It runs with dryRun=true: decisions are logged and nothing is written.
+Read them with
+
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "nvsentinel-capi-remediator.fullname" . }}
+
+and set dryRun=false once they are what you expect.
+{{- end }}

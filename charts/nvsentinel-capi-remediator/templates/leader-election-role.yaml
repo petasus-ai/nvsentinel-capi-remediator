@@ -1,0 +1,27 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nvsentinel-capi-remediator.labels" . | nindent 4 }}
+{{/* Cut from config/rbac/leader_election_role.yaml by `make manifests`. */ -}}
+{{ required "files/leader-election-role-rules.yaml is missing: run make manifests" (.Files.Get "files/leader-election-role-rules.yaml") | trimSuffix "\n" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nvsentinel-capi-remediator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-leader-election
+subjects:
+- kind: ServiceAccount
+  name: {{ include "nvsentinel-capi-remediator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}

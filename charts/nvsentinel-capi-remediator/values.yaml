@@ -1,0 +1,68 @@
+# Image of the manager. The tag defaults to the chart's appVersion; quote a tag
+# made of digits only, or YAML reads it as a number.
+image:
+  repository: quay.io/edgestack/nvsentinel-capi-remediator
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Decisions are logged and nothing is written until this is false: no Machine
+# is marked and no Event recorded. Keep it on for the first run against live
+# clusters, and turn it off once the log shows the decisions you expect.
+dryRun: true
+
+# How often each workload cluster's signals are read.
+pollInterval: 2m
+
+# Label selector limiting which Clusters are watched, e.g. "environment=gpu".
+# Empty selects every Cluster the manager can read.
+clusterSelector: ""
+
+# What to do with a restart that no remediation template can carry out:
+# "report" it, or "replace" the Machine instead. A Cluster overrides it with
+# the nvsentinel.petasus.io/restart-fallback annotation.
+restartFallback: report
+
+# The single replica holds a lease, so that during a rollout the new pod
+# waits for the old one to let go of it.
+leaderElect: true
+
+# Address the metrics endpoint binds to. "0" disables it. The chart adds no
+# container port or Service for it.
+metricsBindAddress: "0"
+
+# Further command-line arguments, e.g. the zap logging flags. They come last,
+# so one that repeats a flag set above overrides it.
+extraArgs: []
+
+serviceAccount:
+  # Create the ServiceAccount, or use an existing one named below.
+  create: true
+  # Defaults to the release's full name.
+  name: ""
+  annotations: {}
+
+rbac:
+  # Create the ClusterRole, the leader election Role and their bindings.
+  create: true
+
+# Memory grows with the number of workload clusters, each of which keeps a
+# Node informer; raise the limit for a large fleet. There is no CPU limit:
+# throttling a burst would delay every cluster's poll. Set a key to null to
+# drop a default; an empty map leaves them in place.
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}

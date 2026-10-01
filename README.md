@@ -139,8 +139,8 @@ so.
 
 Done: signal decoder and decision table with tests built from real
 NVSentinel messages; the controller with workload cluster polling, Machine
-mapping and the replacement path, dry-run by default; the container image and
-kustomize deployment; restarts through the MachineHealthChecks' remediation
+mapping and the replacement path, dry-run by default; the container image,
+kustomize deployment and Helm chart; restarts through the MachineHealthChecks' remediation
 templates, released again once the restart is over, with a configurable
 fallback for restarts no template can carry out; the
 `ExternalRemediationRequest` source, chosen per cluster, with the outcome
@@ -148,13 +148,13 @@ reported back to NVSentinel.
 
 Next:
 
-- Configurable decision table, Helm chart, integration tests.
-- A release workflow that publishes the image.
+- Configurable decision table, integration tests.
+- A release workflow that publishes the image and the chart.
 
 ## Development
 
 ```
-make verify                        # gofmt, go.mod tidiness, license headers, RBAC and kustomize manifests, go vet, tests
+make verify                        # gofmt, go.mod, license headers, RBAC, kustomize and chart manifests, vet, tests
 make docker-build                  # image for the local Docker daemon, tagged IMG
 make docker-buildx IMG=<image>     # linux/amd64 and linux/arm64 image, pushed to IMG
 make deploy IMG=<image>            # render config/default with that image and apply it to the current kubectl context
@@ -169,6 +169,20 @@ log shows the decisions you expect, change the argument to `--dry-run=false`
 to let it act. `make deploy` re-applies the checked-in manifests, so make that
 change in a kustomize overlay of `config/default` if it has to survive a
 redeploy.
+
+The same manager can be installed with the Helm chart in
+`charts/nvsentinel-capi-remediator`, into a namespace of your choice:
+
+```
+helm install nvsentinel-capi-remediator charts/nvsentinel-capi-remediator \
+  --namespace <namespace> --create-namespace \
+  --set image.repository=<repository> --set image.tag=<tag>
+```
+
+It starts in dry-run as well; `--set dryRun=false` lets it act. The other
+settings are described in the chart's `values.yaml`. Install it one way or
+the other: a kustomize and a Helm install in different namespaces each hold
+their own lease, so both would act.
 
 ## Contributing
 

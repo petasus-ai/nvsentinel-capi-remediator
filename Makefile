@@ -6,7 +6,16 @@ RBAC_ARGS = rbac:roleName=manager-role paths="./..."
 # kustomize renders config/ the same way, so building and deploying need Go,
 # docker and kubectl and nothing else.
 KUSTOMIZE ?= $(GO) run sigs.k8s.io/kustomize/kustomize/v5@v5.8.1
+HELM ?= $(GO) run helm.sh/helm/v3/cmd/helm@v3.20.2
 KUBECTL ?= kubectl
+
+CHART = charts/nvsentinel-capi-remediator
+# The chart's roles take their rules from these files, which are cut from
+# the roles under config/rbac so that the two installs cannot drift apart.
+CHART_RULES = $(CHART)/files/manager-role-rules.yaml
+CHART_LEADER_RULES = $(CHART)/files/leader-election-role-rules.yaml
+# Prints a role manifest from its rules line onwards.
+RULES_OF = awk '/^rules:/{p=1} p'
 
 # The image the docker and deploy targets use. The default names no
 # registry, so pushing anywhere is a deliberate IMG=<registry>/<name>:<tag>.
@@ -23,7 +32,7 @@ PUSH ?= true
 # case vet and test are no-ops instead of failing on "no packages".
 PKGS = $(shell $(GO) list ./... 2>/dev/null)
 
-.PHONY: all build fmt vet test manifests verify verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize
+.PHONY: all build fmt vet test manifests verify verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart
 .PHONY: docker-build docker-buildx build-installer deploy undeploy
 
 all: verify build
@@ -51,23 +60,62 @@ verify-boilerplate:
 
 manifests:
 	$(CONTROLLER_GEN) $(RBAC_ARGS) output:rbac:artifacts:config=config/rbac
+	$(RULES_OF) config/rbac/role.yaml > $(CHART_RULES)
+	$(RULES_OF) config/rbac/leader_election_role.yaml > $(CHART_LEADER_RULES)
 
 verify-manifests:
 	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
 	$(CONTROLLER_GEN) $(RBAC_ARGS) output:rbac:artifacts:config="$$tmp" && \
-	if ! diff -u config/rbac/role.yaml "$$tmp/role.yaml"; then echo "config/rbac/role.yaml is stale: run make manifests"; exit 1; fi
+	if ! diff -u config/rbac/role.yaml "$$tmp/role.yaml"; then echo "config/rbac/role.yaml is stale: run make manifests"; exit 1; fi && \
+	$(RULES_OF) "$$tmp/role.yaml" > "$$tmp/rules.yaml" && \
+	if ! diff -u $(CHART_RULES) "$$tmp/rules.yaml"; then echo "$(CHART_RULES) is stale: run make manifests"; exit 1; fi && \
+	$(RULES_OF) config/rbac/leader_election_role.yaml > "$$tmp/leader-rules.yaml" && \
+	if ! diff -u $(CHART_LEADER_RULES) "$$tmp/leader-rules.yaml"; then echo "$(CHART_LEADER_RULES) is stale: run make manifests"; exit 1; fi
 
 # kustomize renders without complaint when the images transformer matches
 # nothing, so both renders are checked for the image they should carry:
 # the checked-in default, and the edit-and-render path that deploy and
 # build-installer use.
 verify-kustomize:
-	@$(KUSTOMIZE) build config/default | grep -q 'image: ghcr.io/petasus-ai/nvsentinel-capi-remediator:latest' || \
+	@$(KUSTOMIZE) build config/default | grep -q 'image: quay.io/edgestack/nvsentinel-capi-remediator:latest' || \
 	  { echo "config/default did not render the default image"; exit 1; }
 	@$(call render,example.com/verify/manager:kustomize) | grep -q 'image: example.com/verify/manager:kustomize' || \
 	  { echo "config/default did not render the image passed to kustomize"; exit 1; }
 
-verify: verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize vet test
+# The chart is linted and rendered three ways: with its defaults, which
+# must stay in dry-run and carry the rules of both roles; with the settings
+# that become arguments; and with a restart fallback the manager would
+# reject, which the chart must refuse by name.
+verify-chart:
+	@$(HELM) lint --quiet $(CHART)
+	@out="$$($(HELM) template remediator $(CHART))" && \
+	printf '%s\n' "$$out" | grep -q 'image: "quay.io/edgestack/nvsentinel-capi-remediator:v' && \
+	printf '%s\n' "$$out" | grep -q -- '- --dry-run=true' && \
+	printf '%s\n' "$$out" | grep -q -- '- --leader-elect' && \
+	printf '%s\n' "$$out" | grep -q -- '- machinehealthchecks' && \
+	printf '%s\n' "$$out" | grep -q -- '- leases' || \
+	  { echo "$(CHART) did not render its default image, dry-run and role rules"; exit 1; }
+	@out="$$($(HELM) template remediator $(CHART) --set image.repository=example.com/verify/manager \
+	  --set image.tag=chart --set dryRun=false --set leaderElect=false --set restartFallback=replace \
+	  --set clusterSelector=a=b --set pollInterval=30s --set metricsBindAddress=:8080 \
+	  --set 'extraArgs={--zap-log-level=debug}')" && \
+	printf '%s\n' "$$out" | grep -q 'image: "example.com/verify/manager:chart"' && \
+	printf '%s\n' "$$out" | grep -q -- '- --dry-run=false' && \
+	printf '%s\n' "$$out" | grep -q -- '- --restart-fallback=replace' && \
+	printf '%s\n' "$$out" | grep -q -- '- "--cluster-selector=a=b"' && \
+	printf '%s\n' "$$out" | grep -q -- '- "--poll-interval=30s"' && \
+	printf '%s\n' "$$out" | grep -q -- '- "--metrics-bind-address=:8080"' && \
+	printf '%s\n' "$$out" | grep -q -- '- "--zap-log-level=debug"' && \
+	! printf '%s\n' "$$out" | grep -q -- '- --leader-elect' || \
+	  { echo "$(CHART) did not render the values passed to it"; exit 1; }
+	@if out="$$($(HELM) template remediator $(CHART) --set restartFallback=reboot 2>&1)"; then \
+	  echo "$(CHART) rendered an unknown restartFallback"; exit 1; \
+	elif ! printf '%s\n' "$$out" | grep -q 'restartFallback'; then \
+	  echo "$(CHART) failed on an unknown restartFallback without naming it:"; printf '%s\n' "$$out"; exit 1; fi
+	@if $(HELM) template remediator $(CHART) --set-string dryRun=false >/dev/null 2>&1; then \
+	  echo "$(CHART) rendered a dryRun that is not a boolean"; exit 1; fi
+
+verify: verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart vet test
 
 docker-build:
 	docker build -t $(IMG) .

@@ -1,0 +1,104 @@
+{{- if not (has .Values.restartFallback (list "report" "replace")) }}
+{{- fail (printf "restartFallback must be \"report\" or \"replace\", got %q" (toString .Values.restartFallback)) }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nvsentinel-capi-remediator.labels" . | nindent 4 }}
+spec:
+  # One replica does the work. Leader election keeps the pod a rollout
+  # starts idle until the lease the previous pod held has expired, about
+  # 15 seconds after that pod stopped renewing it.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "nvsentinel-capi-remediator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nvsentinel-capi-remediator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "nvsentinel-capi-remediator.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 10
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: manager
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+        {{- if .Values.leaderElect }}
+        - --leader-elect
+        {{- end }}
+        - --health-probe-bind-address=:8081
+        - {{ printf "--metrics-bind-address=%v" .Values.metricsBindAddress | quote }}
+        - --dry-run={{ .Values.dryRun }}
+        - {{ printf "--poll-interval=%s" .Values.pollInterval | quote }}
+        {{- with .Values.clusterSelector }}
+        - {{ printf "--cluster-selector=%s" . | quote }}
+        {{- end }}
+        - --restart-fallback={{ .Values.restartFallback }}
+        {{- range .Values.extraArgs }}
+        - {{ . | quote }}
+        {{- end }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        env:
+        # Lets the Go runtime trim the heap before the memory limit is
+        # reached rather than after.
+        - name: GOMEMLIMIT
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.memory
+        {{- with .Values.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

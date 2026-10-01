@@ -7,5 +7,5 @@ resources:
 # it to IMG instead.
 images:
 - name: controller
-  newName: ghcr.io/petasus-ai/nvsentinel-capi-remediator
+  newName: quay.io/edgestack/nvsentinel-capi-remediator
   newTag: latest

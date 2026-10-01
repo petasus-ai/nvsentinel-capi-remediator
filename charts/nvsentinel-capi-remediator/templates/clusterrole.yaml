@@ -1,0 +1,25 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-manager
+  labels:
+    {{- include "nvsentinel-capi-remediator.labels" . | nindent 4 }}
+{{/* Generated from the kubebuilder markers by `make manifests`. */ -}}
+{{ required "files/manager-role-rules.yaml is missing: run make manifests" (.Files.Get "files/manager-role-rules.yaml") | trimSuffix "\n" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-manager
+  labels:
+    {{- include "nvsentinel-capi-remediator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-manager
+subjects:
+- kind: ServiceAccount
+  name: {{ include "nvsentinel-capi-remediator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
