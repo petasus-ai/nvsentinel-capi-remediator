@@ -140,21 +140,23 @@ so.
 Done: signal decoder and decision table with tests built from real
 NVSentinel messages; the controller with workload cluster polling, Machine
 mapping and the replacement path, dry-run by default; the container image,
-kustomize deployment and Helm chart; restarts through the MachineHealthChecks' remediation
-templates, released again once the restart is over, with a configurable
-fallback for restarts no template can carry out; the
-`ExternalRemediationRequest` source, chosen per cluster, with the outcome
-reported back to NVSentinel.
+kustomize deployment and Helm chart; restarts through the
+MachineHealthChecks' remediation templates, released again once the restart
+is over, with a configurable fallback for restarts no template can carry
+out; the `ExternalRemediationRequest` source, chosen per cluster, with the
+outcome reported back to NVSentinel; integration tests that run the manager
+against real API servers.
 
 Next:
 
-- Configurable decision table, integration tests.
+- Configurable decision table.
 - A release workflow that publishes the image and the chart.
 
 ## Development
 
 ```
-make verify                        # gofmt, go.mod, license headers, RBAC, kustomize and chart manifests, vet, tests
+make verify                        # gofmt, go.mod, license headers, manifests, vet, unit and integration tests
+make test-integration              # the manager against two real API servers, downloaded on first use
 make docker-build                  # image for the local Docker daemon, tagged IMG
 make docker-buildx IMG=<image>     # linux/amd64 and linux/arm64 image, pushed to IMG
 make deploy IMG=<image>            # render config/default with that image and apply it to the current kubectl context

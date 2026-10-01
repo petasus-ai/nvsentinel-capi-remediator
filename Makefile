@@ -7,6 +7,11 @@ RBAC_ARGS = rbac:roleName=manager-role paths="./..."
 # docker and kubectl and nothing else.
 KUSTOMIZE ?= $(GO) run sigs.k8s.io/kustomize/kustomize/v5@v5.8.1
 HELM ?= $(GO) run helm.sh/helm/v3/cmd/helm@v3.20.2
+# setup-envtest downloads the API server and etcd the integration tests run
+# against. It is released with controller-runtime, and pinned to the version
+# of it the module requires.
+ENVTEST ?= $(GO) run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.24.1
+ENVTEST_K8S_VERSION ?= 1.36.x
 KUBECTL ?= kubectl
 
 CHART = charts/nvsentinel-capi-remediator
@@ -28,11 +33,12 @@ PLATFORMS ?= linux/amd64,linux/arm64
 # registry. Anything else pushes.
 PUSH ?= true
 
-# Go packages in the module. Empty until the first package lands, in which
-# case vet and test are no-ops instead of failing on "no packages".
+# Go packages in the module, without the ones behind a build tag. Empty
+# until the first package lands, in which case test is a no-op instead of
+# failing on "no packages".
 PKGS = $(shell $(GO) list ./... 2>/dev/null)
 
-.PHONY: all build fmt vet test manifests verify verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart
+.PHONY: all build fmt vet test test-integration manifests verify verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart
 .PHONY: docker-build docker-buildx build-installer deploy undeploy
 
 all: verify build
@@ -43,11 +49,21 @@ build:
 fmt:
 	$(GO) fmt ./...
 
+# The integration tests are behind a build tag, so vet is given it to see
+# them, while test leaves them to test-integration.
 vet:
-	@if [ -n "$(PKGS)" ]; then $(GO) vet $(PKGS); else echo "vet: no Go packages yet"; fi
+	$(GO) vet -tags integration ./...
 
 test:
 	@if [ -n "$(PKGS)" ]; then $(GO) test $(PKGS); else echo "test: no Go packages yet"; fi
+
+# The integration tests run the manager against two real API servers, a
+# management and a workload one. A KUBEBUILDER_ASSETS already set is used as
+# it is. The result is never taken from the test cache: it depends on those
+# binaries and on timing, which the cache does not see.
+test-integration:
+	@assets="$${KUBEBUILDER_ASSETS:-$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)}" && \
+	KUBEBUILDER_ASSETS="$$assets" $(GO) test -count=1 -tags integration ./test/integration/...
 
 verify-fmt:
 	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "gofmt needed on:"; echo "$$out"; exit 1; fi
@@ -115,7 +131,7 @@ verify-chart:
 	@if $(HELM) template remediator $(CHART) --set-string dryRun=false >/dev/null 2>&1; then \
 	  echo "$(CHART) rendered a dryRun that is not a boolean"; exit 1; fi
 
-verify: verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart vet test
+verify: verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart vet test test-integration
 
 docker-build:
 	docker build -t $(IMG) .

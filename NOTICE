@@ -7,7 +7,10 @@ This product interoperates with NVSentinel (https://github.com/NVIDIA/NVSentinel
 Copyright NVIDIA CORPORATION, licensed under the Apache License, Version 2.0.
 The recommended-action names and the node condition message layout decoded by
 this product follow the formats NVSentinel publishes. No NVSentinel source code
-is included in this product.
+is included in this product, except that
+test/integration/testdata/external_remediation.crd.yaml is an unmodified copy
+of NVSentinel's ExternalRemediationRequest CustomResourceDefinition (v1.23.0),
+used only by this product's integration tests.
 
 This product interoperates with Cluster API (https://github.com/kubernetes-sigs/cluster-api),
 Copyright The Kubernetes Authors, licensed under the Apache License, Version 2.0.
