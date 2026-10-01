@@ -37,13 +37,13 @@ const (
 	// nothing else. The resource ships with NVSentinel's janitor, since
 	// NVSentinel v1.10, and the janitor remediates by itself every action
 	// that is not routed to a request, so node conditions are left to it.
-	// Before v1.14 the janitor never releases a node to a request, so such
+	// Before v1.13 the janitor never releases a node to a request, so such
 	// a cluster is observed without anything to report.
 	ModeExternalRemediationRequest Mode = "ExternalRemediationRequest"
 	// ModeReportOnly reads node conditions and only reports them. The
-	// janitor is installed without ExternalRemediationRequest, as in
-	// NVSentinel v0.5 to v1.9, so it remediates the faults itself and
-	// acting on them too would remediate the same node twice.
+	// janitor is installed without ExternalRemediationRequest, as before
+	// NVSentinel v1.10, so it remediates the faults itself and acting on
+	// them too would remediate the same node twice.
 	ModeReportOnly Mode = "ReportOnly"
 	// ModeNodeCondition reads node conditions and acts on them. NVSentinel
 	// only detects faults in this cluster.

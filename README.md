@@ -21,7 +21,9 @@ where the cluster's MachineHealthChecks remediate through a template, to a
 restart, and records what it did as Events on them. A Machine marked for a
 restart is released again once the restart is over, and a request is
 answered with the outcome. The design below describes the whole of what is
-being built.
+being built. For running it, see [docs/configuration.md](docs/configuration.md),
+[docs/operations.md](docs/operations.md) and, for the NVSentinel side,
+[docs/nvsentinel.md](docs/nvsentinel.md).
 
 ## Design
 
@@ -41,9 +43,9 @@ being built.
      detection-only mode. Messages that hit the connector's length limit are
      flagged, since those have lost trailing events.
 
-   A cluster with the janitor but without `ExternalRemediationRequest`, as in
-   NVSentinel v0.5 to v1.9, is observed but not acted on, so that two systems
-   never remediate the same node. With NVSentinel v1.10 to v1.13 the resource
+   A cluster with the janitor but without `ExternalRemediationRequest`, as
+   before NVSentinel v1.10, is observed but not acted on, so that two systems
+   never remediate the same node. With NVSentinel v1.10 to v1.12 the resource
    is served but the janitor never releases a node to a request, so nothing
    there is reported either. The source chosen for a cluster is recorded
    as an Event on the Cluster when it is first chosen after the operator
@@ -125,7 +127,7 @@ the operator's annotation prefix), which takes effect on the next poll. An
 invalid annotation is ignored, and the Events of the signals it affects say
 so.
 
-## Planned safeguards
+## Safeguards
 
 - Dry-run is the default. Decisions are logged and nothing is written until
   remediation is enabled explicitly.
@@ -182,9 +184,9 @@ helm install nvsentinel-capi-remediator charts/nvsentinel-capi-remediator \
 ```
 
 It starts in dry-run as well; `--set dryRun=false` lets it act. The other
-settings are described in the chart's `values.yaml`. Install it one way or
-the other: a kustomize and a Helm install in different namespaces each hold
-their own lease, so both would act.
+settings are described in [docs/configuration.md](docs/configuration.md).
+Install it one way or the other: a kustomize and a Helm install in different
+namespaces each hold their own lease, so both would act.
 
 ## Contributing
 
