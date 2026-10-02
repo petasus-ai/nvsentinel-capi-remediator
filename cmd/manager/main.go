@@ -136,7 +136,14 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
 		LeaderElectionID:       controller.ControllerName + "." + capi.AnnotationPrefix,
-		Cache:                  cacheOpts,
+		// The lease is given up when the manager stops, so that the pod
+		// replacing this one in a rollout does not wait for it to expire.
+		// The manager stops its controllers first, but it also lets go
+		// when a shutdown times out or a renewal fails, so this is only
+		// safe because main returns as soon as Start does: nothing may be
+		// added after it.
+		LeaderElectionReleaseOnCancel: true,
+		Cache:                         cacheOpts,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create manager")

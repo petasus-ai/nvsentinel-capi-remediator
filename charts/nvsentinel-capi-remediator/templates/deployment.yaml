@@ -10,8 +10,9 @@ metadata:
     {{- include "nvsentinel-capi-remediator.labels" . | nindent 4 }}
 spec:
   # One replica does the work. Leader election keeps the pod a rollout
-  # starts idle until the lease the previous pod held has expired, about
-  # 15 seconds after that pod stopped renewing it.
+  # starts idle until the previous pod gives up its lease, which it does
+  # on a clean shutdown; a pod that is killed leaves it to expire, about
+  # 15 seconds after its last renewal.
   replicas: 1
   selector:
     matchLabels:
