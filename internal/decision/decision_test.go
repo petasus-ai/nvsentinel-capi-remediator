@@ -306,6 +306,85 @@ func TestEntriesAndCustomActions(t *testing.T) {
 	}
 }
 
+func TestParseOverrides(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want map[string]string
+	}{
+		{"empty", "", map[string]string{}},
+		{"one", "COMPONENT_RESET=restart", map[string]string{"COMPONENT_RESET": "restart"}},
+		{
+			"several, with spaces and a trailing comma",
+			" COMPONENT_RESET = Restart , reset-fabric=report,",
+			map[string]string{"COMPONENT_RESET": "Restart", "reset-fabric": "report"},
+		},
+		{"empty decision is left for New to reject", "CUSTOM=", map[string]string{"CUSTOM": ""}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseOverrides(tt.in)
+			if err != nil {
+				t.Fatalf("ParseOverrides(%q): %v", tt.in, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ParseOverrides(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseOverridesRejectsBadEntries(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		wantErr string
+	}{
+		{"no decision", "COMPONENT_RESET", `"COMPONENT_RESET" is not ACTION=decision`},
+		{"no action", "=restart", `"=restart" is not ACTION=decision`},
+		{"listed twice", "CUSTOM=report, CUSTOM=restart", `action "CUSTOM" is listed twice`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseOverrides(tt.in)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("ParseOverrides(%q) error = %v, want it to contain %q", tt.in, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestParseOverridesFeedsNew pins the two halves together: what the command
+// line accepts builds the table it describes, and a decision that does not
+// exist is refused.
+func TestParseOverridesFeedsNew(t *testing.T) {
+	overrides, err := ParseOverrides("COMPONENT_RESET=restart,reset-fabric=Replace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, err := New(overrides)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := table.Lookup(signal.ActionComponentReset); d != Restart {
+		t.Errorf("COMPONENT_RESET = %s, want %s", d, Restart)
+	}
+	if d, ok := table.Lookup("reset-fabric"); !ok || d != Replace {
+		t.Errorf("reset-fabric = %s (listed %t), want %s", d, ok, Replace)
+	}
+	if d, _ := table.Lookup(signal.ActionReplaceVM); d != Replace {
+		t.Errorf("REPLACE_VM = %s, want the default %s", d, Replace)
+	}
+
+	overrides, err = ParseOverrides("COMPONENT_RESET=reboot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(overrides); err == nil {
+		t.Error("New accepted the decision \"reboot\"")
+	}
+}
+
 func TestParseDecision(t *testing.T) {
 	for name, want := range map[string]Decision{"Replace": Replace, "restart": Restart, "REPORT": Report} {
 		got, err := ParseDecision(name)

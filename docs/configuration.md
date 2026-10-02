@@ -27,6 +27,7 @@ be set up in the workload clusters.
 | `--poll-interval` | `pollInterval` | `2m` | How often each workload cluster's signals are read. |
 | `--cluster-selector` | `clusterSelector` | empty | Label selector for the Clusters to watch, e.g. `environment=gpu`. Empty selects every Cluster. Clusters it does not select are never connected to. |
 | `--restart-fallback` | `restartFallback` | `report` | What to do with a restart no remediation template can carry out: `report` it, or `replace` the Machine. |
+| `--decisions` | `decisions` | empty | Entries replacing those of the [decision table](#decisions), as comma-separated `ACTION=decision` pairs; in the chart, a map of action to decision. |
 | `--leader-elect` | `leaderElect` | off (chart and kustomize: on) | Hold a lease so that only one replica acts. |
 | `--metrics-bind-address` | `metricsBindAddress` | `0` | Address of the metrics endpoint. `0` disables it. |
 | `--health-probe-bind-address` | fixed to `:8081` | `:8081` | Address of `/healthz` and `/readyz`. |
@@ -58,7 +59,8 @@ either.
 
 ## Decisions
 
-The mapping from NVSentinel's recommended action to a decision is built in:
+NVSentinel's recommended action is mapped to a decision by a table. Its
+defaults:
 
 | Recommended action | Decision |
 |---|---|
@@ -67,6 +69,49 @@ The mapping from NVSentinel's recommended action to a decision is built in:
 | `NONE`, `COMPONENT_RESET`, `CONTACT_SUPPORT`, `RUN_FIELDDIAG`, `RUN_DCGMEUD`, `CUSTOM`, anything unknown | Report |
 
 When a signal carries several actions, the most disruptive one wins.
+
+`--decisions` replaces entries and adds new ones; actions it does not list
+keep their default:
+
+```
+--decisions=COMPONENT_RESET=restart,reset-fabric=restart
+```
+
+```yaml
+decisions:
+  COMPONENT_RESET: restart
+  reset-fabric: restart
+```
+
+- A decision is `report`, `restart` or `replace`. The flag takes them in any
+  case, the chart in lower case only. Anything else stops the manager at
+  startup, and the chart from rendering.
+- An action is matched by its exact name. One that NVSentinel does not
+  recommend itself is taken for the name of a custom action, so a misspelt
+  built-in name changes nothing; the manager lists such entries in its log
+  when it starts. A name with a comma or `=` in it cannot be listed, and the
+  chart refuses white space in one as well.
+- A custom action is known by its name only in an
+  `ExternalRemediationRequest`, and there the `CUSTOM` entry only applies to
+  a request that leaves the name out. A node condition carries `CUSTOM` for
+  every custom action.
+- An entry applies to the signals the operator reads; see
+  [Signal source](#signal-source). Where it reads requests, those are the
+  actions NVSentinel routes to a request ([nvsentinel.md](nvsentinel.md)),
+  and an entry for any other action has no effect. Where NVSentinel's
+  janitor remediates, nothing is acted on whatever the table says.
+- Mapping an action that is routed to requests to `report` declines every
+  such request: the answer is `False`, and the node stays cordoned and
+  released until the request is deleted; see
+  [operations.md](operations.md#how-requests-are-answered).
+- The defaults report everything a restart or a replacement is not known to
+  fix. Before mapping such an action to one, check what raises it in your
+  clusters: a fault that a new node inherits, or a false positive, then costs
+  a node each time it is reported. A restart can end in a replacement too:
+  when no remediation template can carry it out and the restart fallback is
+  `replace`, or when the provider gives up on restarting. Try a new table in
+  dry run first: taking an entry out again does not take back a replacement
+  that was already asked for.
 
 ## Signal source
 

@@ -26,6 +26,14 @@ clusterSelector: ""
 # the nvsentinel.petasus.io/restart-fallback annotation.
 restartFallback: report
 
+# Entries replacing those of the built-in decision table: the recommended
+# action of NVSentinel, or the name of a custom one, and what to do about it,
+# "report", "restart" or "replace". Actions not listed keep their default,
+# e.g.
+#   decisions:
+#     COMPONENT_RESET: restart
+decisions: {}
+
 # The single replica holds a lease, so that during a rollout the new pod
 # waits for the old one to let go of it.
 leaderElect: true

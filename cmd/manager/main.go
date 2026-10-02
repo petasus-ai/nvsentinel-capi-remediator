@@ -58,6 +58,7 @@ func main() {
 		probeAddr       string
 		clusterSelector string
 		restartFallback string
+		decisions       string
 		leaderElect     bool
 		dryRun          bool
 		pollInterval    time.Duration
@@ -77,6 +78,10 @@ func main() {
 	flag.StringVar(&restartFallback, "restart-fallback", string(controller.RestartFallbackReport),
 		"What to do with a restart that no remediation template can carry out: report it, or replace the Machine instead. "+
 			"A Cluster overrides it with the "+controller.RestartFallbackAnnotation+" annotation.")
+	flag.StringVar(&decisions, "decisions", "",
+		"Entries replacing those of the built-in decision table, as comma-separated ACTION=decision pairs, "+
+			"e.g. COMPONENT_RESET=restart. An action is one NVSentinel recommends or the name of a custom one; "+
+			"a decision is report, restart or replace.")
 	zapOpts := zap.Options{}
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -97,6 +102,23 @@ func main() {
 	if err != nil {
 		setupLog.Error(err, "invalid --restart-fallback")
 		os.Exit(1)
+	}
+
+	overrides, err := decision.ParseOverrides(decisions)
+	if err != nil {
+		setupLog.Error(err, "invalid --decisions")
+		os.Exit(1)
+	}
+	table, err := decision.New(overrides)
+	if err != nil {
+		setupLog.Error(err, "invalid --decisions")
+		os.Exit(1)
+	}
+	if custom := table.CustomActions(); len(custom) > 0 {
+		// A misspelt built-in action ends up here too, and would otherwise
+		// leave the default in force without a word.
+		setupLog.Info("the decision table has entries for actions NVSentinel does not recommend itself; "+
+			"they apply to custom actions of exactly these names", "actions", custom)
 	}
 
 	cacheOpts := cache.Options{}
@@ -143,7 +165,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	table := decision.Default()
 	reconciler := &controller.ClusterReconciler{
 		Client:          mgr.GetClient(),
 		ClusterCache:    clusterCache,

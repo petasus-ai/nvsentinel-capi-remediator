@@ -609,6 +609,35 @@ func TestReconcileRestartsThroughRemediationTemplates(t *testing.T) {
 	assertEvents(t, f.events())
 }
 
+// TestReconcileFollowsTheDecisionTable pins that the table the reconciler is
+// given decides, not the built-in one: an action the defaults report is
+// acted on once an entry says so, and one they act on is left alone.
+func TestReconcileFollowsTheDecisionTable(t *testing.T) {
+	table, err := decision.New(map[string]string{"CONTACT_SUPPORT": "restart", "RESTART_BM": "report"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+		[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1"), newMachine("gpu-w-2", "gpu-w-2")},
+		newNode("gpu-w-1", raised("GpuThermal", reportMessage)),
+		newNode("gpu-w-2", raised("GpuXidError", restartMessage)))
+	f.r.Table = table
+
+	assertPoll(t, f.reconcile(t))
+
+	m := f.machine(t, "gpu-w-1")
+	if !capi.IsMarkedForRemediation(m) {
+		t.Fatal("an action mapped to Restart did not mark the Machine")
+	}
+	if got := m.Annotations[capi.RemediationReasonAnnotation]; !strings.Contains(got, "CONTACT_SUPPORT maps to Restart") {
+		t.Fatalf("reason annotation = %q, want it to name the entry", got)
+	}
+	if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-2")) {
+		t.Fatal("an action mapped to Report marked the Machine")
+	}
+}
+
 func TestReconcileReportsRestartsNoTemplateCanCarryOut(t *testing.T) {
 	tests := []struct {
 		name   string

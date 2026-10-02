@@ -78,11 +78,15 @@ being built. For running it, see [docs/configuration.md](docs/configuration.md),
 |---|---|---|
 | `REPLACE_VM` | Replace | Set the `cluster.x-k8s.io/remediate-machine` annotation on the Machine. Every MachineHealthCheck selecting it honours the annotation regardless of its configured checks and applies its remediation: the owning MachineSet replaces the Machine, or, where the check has a remediation template, the provider's remediation runs first. |
 | `RESTART_VM`, `RESTART_BM` | Restart | The same annotation, set only when every MachineHealthCheck selecting the Machine remediates through a template (`spec.remediation.templateRef`). The check creates the request from its template and the infrastructure provider's remediation controller performs the restart. |
-| `CONTACT_SUPPORT`, `COMPONENT_RESET`, `RUN_FIELDDIAG`, `NONE`, … | Report | Log and emit an Event. These never delete a node: DCGM reports a false IMEX failure on topologies without a multi-node NVLink domain (NVIDIA/NVSentinel#1471), and honouring the recommended action is what keeps that from costing a node. |
+| `CONTACT_SUPPORT`, `COMPONENT_RESET`, `RUN_FIELDDIAG`, `NONE`, … | Report | Log and emit an Event. By default these never delete a node: DCGM reports a false IMEX failure on topologies without a multi-node NVLink domain (NVIDIA/NVSentinel#1471), and honouring the recommended action is what keeps that from costing a node. |
 
 NVSentinel's `_VM` and `_BM` suffixes are lifecycle verbs rather than a
 statement about what backs the node (NVIDIA/NVSentinel#1661), so the table
 applies unchanged whatever the infrastructure provider is.
+
+The table above is the default. `--decisions` replaces entries and maps
+custom actions by name; see
+[docs/configuration.md](docs/configuration.md#decisions).
 
 ## Provider neutrality
 
@@ -146,13 +150,10 @@ kustomize deployment and Helm chart; restarts through the
 MachineHealthChecks' remediation templates, released again once the restart
 is over, with a configurable fallback for restarts no template can carry
 out; the `ExternalRemediationRequest` source, chosen per cluster, with the
-outcome reported back to NVSentinel; integration tests that run the manager
-against real API servers; a release workflow that publishes the image and
-the chart for every version tag.
-
-Next:
-
-- Configurable decision table.
+outcome reported back to NVSentinel; a decision table whose entries can be
+replaced; integration tests that run the manager against real API servers;
+a release workflow that publishes the image and the chart for every version
+tag.
 
 ## Development
 

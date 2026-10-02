@@ -101,11 +101,12 @@ verify-kustomize:
 	@$(call render,example.com/verify/manager:kustomize) | grep -q 'image: example.com/verify/manager:kustomize' || \
 	  { echo "config/default did not render the image passed to kustomize"; exit 1; }
 
-# The chart is linted and rendered three ways: with its defaults, which
-# must stay in dry-run and carry the rules of both roles; with the settings
-# that become arguments; and with a restart fallback the manager would
-# reject, which the chart must refuse by name. It is then packaged the way
-# a release packages it, which must make the release's image the default.
+# The chart is linted and rendered: with its defaults, which must stay in
+# dry-run and carry the rules of both roles; with the settings that become
+# arguments; and with a restart fallback and with a decision the manager
+# would reject, each of which the chart must refuse by name. It is then
+# packaged the way a release packages it, which must make the release's
+# image the default.
 verify-chart:
 	@$(HELM) lint --quiet $(CHART)
 	@out="$$($(HELM) template remediator $(CHART))" && \
@@ -113,11 +114,13 @@ verify-chart:
 	printf '%s\n' "$$out" | grep -q -- '- --dry-run=true' && \
 	printf '%s\n' "$$out" | grep -q -- '- --leader-elect' && \
 	printf '%s\n' "$$out" | grep -q -- '- machinehealthchecks' && \
-	printf '%s\n' "$$out" | grep -q -- '- leases' || \
+	printf '%s\n' "$$out" | grep -q -- '- leases' && \
+	! printf '%s\n' "$$out" | grep -q -- '--decisions' || \
 	  { echo "$(CHART) did not render its default image, dry-run and role rules"; exit 1; }
 	@out="$$($(HELM) template remediator $(CHART) --set image.repository=example.com/verify/manager \
 	  --set image.tag=chart --set dryRun=false --set leaderElect=false --set restartFallback=replace \
 	  --set clusterSelector=a=b --set pollInterval=30s --set metricsBindAddress=:8080 \
+	  --set decisions.reset-fabric=report --set decisions.COMPONENT_RESET=restart \
 	  --set 'extraArgs={--zap-log-level=debug}')" && \
 	printf '%s\n' "$$out" | grep -q 'image: "example.com/verify/manager:chart"' && \
 	printf '%s\n' "$$out" | grep -q -- '- --dry-run=false' && \
@@ -125,6 +128,7 @@ verify-chart:
 	printf '%s\n' "$$out" | grep -q -- '- "--cluster-selector=a=b"' && \
 	printf '%s\n' "$$out" | grep -q -- '- "--poll-interval=30s"' && \
 	printf '%s\n' "$$out" | grep -q -- '- "--metrics-bind-address=:8080"' && \
+	printf '%s\n' "$$out" | grep -q -- '- "--decisions=COMPONENT_RESET=restart,reset-fabric=report"' && \
 	printf '%s\n' "$$out" | grep -q -- '- "--zap-log-level=debug"' && \
 	! printf '%s\n' "$$out" | grep -q -- '- --leader-elect' || \
 	  { echo "$(CHART) did not render the values passed to it"; exit 1; }
@@ -132,6 +136,10 @@ verify-chart:
 	  echo "$(CHART) rendered an unknown restartFallback"; exit 1; \
 	elif ! printf '%s\n' "$$out" | grep -q 'restartFallback'; then \
 	  echo "$(CHART) failed on an unknown restartFallback without naming it:"; printf '%s\n' "$$out"; exit 1; fi
+	@if out="$$($(HELM) template remediator $(CHART) --set decisions.COMPONENT_RESET=reboot 2>&1)"; then \
+	  echo "$(CHART) rendered an unknown decision"; exit 1; \
+	elif ! printf '%s\n' "$$out" | grep -q 'decisions'; then \
+	  echo "$(CHART) failed on an unknown decision without naming it:"; printf '%s\n' "$$out"; exit 1; fi
 	@if $(HELM) template remediator $(CHART) --set-string dryRun=false >/dev/null 2>&1; then \
 	  echo "$(CHART) rendered a dryRun that is not a boolean"; exit 1; fi
 	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \

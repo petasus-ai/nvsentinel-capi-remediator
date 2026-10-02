@@ -12,6 +12,16 @@
       "type": "string",
       "enum": ["report", "replace"]
     },
+    "decisions": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[^,=\\s]+$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["report", "restart", "replace"]
+      }
+    },
     "pollInterval": {
       "type": "string"
     },

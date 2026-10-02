@@ -19,8 +19,8 @@ limitations under the License.
 // NVSentinel recommends one of a fixed set of actions per fault. This operator
 // can express three outcomes through Cluster API, so a table maps each
 // recommended action to one of them. The table has a built-in default and can
-// be overridden entry by entry; it is plain data, and the file format that
-// carries overrides is the caller's concern.
+// be overridden entry by entry. It is plain data: ParseOverrides reads the
+// form a command line carries, and any other format is the caller's concern.
 package decision
 
 import (
@@ -132,6 +132,32 @@ func New(overrides map[string]string) (*Table, error) {
 	}
 
 	return t, nil
+}
+
+// ParseOverrides reads table entries as they are written on a command line:
+// comma-separated ACTION=decision pairs, such as
+// "COMPONENT_RESET=restart,reset-fabric=report". The result is what New
+// takes; an empty string has no entries. An action listed twice is an error,
+// since which decision was meant cannot be told.
+func ParseOverrides(s string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, pair := range strings.Split(s, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		action, name, ok := strings.Cut(pair, "=")
+		action = strings.TrimSpace(action)
+		if !ok || action == "" {
+			return nil, fmt.Errorf("decision table: %q is not ACTION=decision", pair)
+		}
+		if _, listed := out[action]; listed {
+			return nil, fmt.Errorf("decision table: action %q is listed twice", action)
+		}
+		out[action] = strings.TrimSpace(name)
+	}
+
+	return out, nil
 }
 
 // Entries returns a copy of the table, for logging the effective mapping.

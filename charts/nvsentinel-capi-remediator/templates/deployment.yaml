@@ -58,6 +58,13 @@ spec:
         - {{ printf "--cluster-selector=%s" . | quote }}
         {{- end }}
         - --restart-fallback={{ .Values.restartFallback }}
+        {{- with .Values.decisions }}
+        {{- $entries := list }}
+        {{- range $action, $decision := . }}
+        {{- $entries = append $entries (printf "%s=%s" $action $decision) }}
+        {{- end }}
+        - {{ printf "--decisions=%s" (join "," $entries) | quote }}
+        {{- end }}
         {{- range .Values.extraArgs }}
         - {{ . | quote }}
         {{- end }}
