@@ -21,6 +21,9 @@ CHART_RULES = $(CHART)/files/manager-role-rules.yaml
 CHART_LEADER_RULES = $(CHART)/files/leader-election-role-rules.yaml
 # Prints a role manifest from its rules line onwards.
 RULES_OF = awk '/^rules:/{p=1} p'
+# A release tag: v<major>.<minor>.<patch> with an optional pre-release suffix
+# and no build metadata, which an image tag cannot carry.
+RELEASE_TAG = v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?
 
 # The image the docker and deploy targets use. The default names no
 # registry, so pushing anywhere is a deliberate IMG=<registry>/<name>:<tag>.
@@ -39,7 +42,7 @@ PUSH ?= true
 PKGS = $(shell $(GO) list ./... 2>/dev/null)
 
 .PHONY: all build fmt vet test test-integration manifests verify verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart
-.PHONY: docker-build docker-buildx build-installer deploy undeploy
+.PHONY: docker-build docker-buildx build-installer chart-package deploy undeploy
 
 all: verify build
 
@@ -101,7 +104,8 @@ verify-kustomize:
 # The chart is linted and rendered three ways: with its defaults, which
 # must stay in dry-run and carry the rules of both roles; with the settings
 # that become arguments; and with a restart fallback the manager would
-# reject, which the chart must refuse by name.
+# reject, which the chart must refuse by name. It is then packaged the way
+# a release packages it, which must make the release's image the default.
 verify-chart:
 	@$(HELM) lint --quiet $(CHART)
 	@out="$$($(HELM) template remediator $(CHART))" && \
@@ -130,14 +134,23 @@ verify-chart:
 	  echo "$(CHART) failed on an unknown restartFallback without naming it:"; printf '%s\n' "$$out"; exit 1; fi
 	@if $(HELM) template remediator $(CHART) --set-string dryRun=false >/dev/null 2>&1; then \
 	  echo "$(CHART) rendered a dryRun that is not a boolean"; exit 1; fi
+	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	$(HELM) package $(CHART) --version 0.0.0 --app-version v0.0.0 -d "$$tmp" >/dev/null && \
+	$(HELM) template remediator "$$tmp/nvsentinel-capi-remediator-0.0.0.tgz" | \
+	  grep -q 'image: "quay.io/edgestack/nvsentinel-capi-remediator:v0.0.0"' || \
+	  { echo "the packaged $(CHART) did not default its image to the release"; exit 1; }
 
 verify: verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart vet test test-integration
 
 docker-build:
 	docker build -t $(IMG) .
 
+# No provenance or SBOM attestations: they are added to the image index as
+# entries for an unknown platform, which tools that mirror an image
+# platform by platform cannot copy.
 docker-buildx:
-	docker buildx build --platform $(PLATFORMS) -t $(IMG) $(if $(filter false,$(PUSH)),--output type=cacheonly,--push) .
+	docker buildx build --platform $(PLATFORMS) --provenance=false --sbom=false -t $(IMG) \
+	  $(if $(filter false,$(PUSH)),--output type=cacheonly,--push) .
 
 # Renders config/default with the image $(1) in place of the default. The
 # checked-in kustomization stays untouched: kustomize edits a copy.
@@ -152,6 +165,17 @@ build-installer:
 	@mkdir -p dist
 	@$(call render,$(IMG)) > dist/install.yaml
 	@echo "wrote dist/install.yaml with image $(IMG)"
+
+# Packages the chart for the release VERSION, a tag such as v0.1.0: the
+# chart version is the tag without its v, and the appVersion, which the
+# image tag defaults to, is the tag itself. The recipe reads VERSION from
+# the environment, where make puts it, so that it is checked before it is
+# part of a shell command line.
+chart-package:
+	@printf '%s\n' "$$VERSION" | grep -Eqx '$(RELEASE_TAG)' || \
+	  { echo "VERSION must be a release tag such as v0.1.0 or v0.1.0-rc.1"; exit 1; }
+	@mkdir -p dist
+	$(HELM) package $(CHART) --version "$${VERSION#v}" --app-version "$$VERSION" -d dist
 
 deploy:
 	@$(call render,$(IMG)) | $(KUBECTL) apply -f -

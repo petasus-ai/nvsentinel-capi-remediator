@@ -2,7 +2,15 @@
 
 ## Installing
 
-With Helm, into the namespace of your choice:
+With Helm, a released version into the namespace of your choice:
+
+```
+helm install nvsentinel-capi-remediator nvsentinel-capi-remediator \
+  --repo https://raw.githubusercontent.com/petasus-ai/edgestack-helm/master/ \
+  --version <version> --namespace <namespace> --create-namespace
+```
+
+or the chart of a checkout, with an image you built:
 
 ```
 helm install nvsentinel-capi-remediator charts/nvsentinel-capi-remediator \
@@ -17,9 +25,13 @@ or with the kustomize manifests, which install into
 make deploy IMG=<repository>:<tag>
 ```
 
-Install it one way or the other, not both. No image is published yet, so
-build and push one first with `make docker-buildx IMG=<repository>:<tag>`.
-The settings are listed in [configuration.md](configuration.md).
+Install it one way or the other, not both. Each release publishes its
+image as `quay.io/edgestack/nvsentinel-capi-remediator:<tag>`, which the
+released chart uses by default; the chart version is the tag without its
+`v`. The GitHub release also carries the kustomize manifests rendered with
+that image, as `install.yaml`. For an unreleased commit, build and push an
+image with `make docker-buildx IMG=<repository>:<tag>`. The settings are
+listed in [configuration.md](configuration.md).
 
 ## First run
 

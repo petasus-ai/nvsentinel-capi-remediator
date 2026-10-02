@@ -147,12 +147,12 @@ MachineHealthChecks' remediation templates, released again once the restart
 is over, with a configurable fallback for restarts no template can carry
 out; the `ExternalRemediationRequest` source, chosen per cluster, with the
 outcome reported back to NVSentinel; integration tests that run the manager
-against real API servers.
+against real API servers; a release workflow that publishes the image and
+the chart for every version tag.
 
 Next:
 
 - Configurable decision table.
-- A release workflow that publishes the image and the chart.
 
 ## Development
 
@@ -163,16 +163,19 @@ make docker-build                  # image for the local Docker daemon, tagged I
 make docker-buildx IMG=<image>     # linux/amd64 and linux/arm64 image, pushed to IMG
 make deploy IMG=<image>            # render config/default with that image and apply it to the current kubectl context
 make build-installer IMG=<image>   # the same rendering, written to dist/install.yaml
+make chart-package VERSION=<tag>   # the chart for that release, written to dist/
 make undeploy
 ```
 
-No image is published yet, so `IMG` has to name one you pushed with
-`make docker-buildx`. The manager is deployed to the
-`nvsentinel-capi-remediator-system` namespace with `--dry-run=true`. Once its
-log shows the decisions you expect, change the argument to `--dry-run=false`
-to let it act. `make deploy` re-applies the checked-in manifests, so make that
-change in a kustomize overlay of `config/default` if it has to survive a
-redeploy.
+A release publishes its image as
+`quay.io/edgestack/nvsentinel-capi-remediator:<tag>` and attaches an
+`install.yaml` rendered with it to the GitHub release; for anything else
+`IMG` has to name an image you pushed with `make docker-buildx`. The manager
+is deployed to the `nvsentinel-capi-remediator-system` namespace with
+`--dry-run=true`. Once its log shows the decisions you expect, change the
+argument to `--dry-run=false` to let it act. `make deploy` re-applies the
+checked-in manifests, so make that change in a kustomize overlay of
+`config/default` if it has to survive a redeploy.
 
 The same manager can be installed with the Helm chart in
 `charts/nvsentinel-capi-remediator`, into a namespace of your choice:
@@ -183,10 +186,17 @@ helm install nvsentinel-capi-remediator charts/nvsentinel-capi-remediator \
   --set image.repository=<repository> --set image.tag=<tag>
 ```
 
-It starts in dry-run as well; `--set dryRun=false` lets it act. The other
-settings are described in [docs/configuration.md](docs/configuration.md).
-Install it one way or the other: a kustomize and a Helm install in different
-namespaces each hold their own lease, so both would act.
+The manager starts in dry-run this way as well; `--set dryRun=false` lets it
+act. The other settings are described in
+[docs/configuration.md](docs/configuration.md). Install it one way or the
+other: a kustomize and a Helm install in different namespaces each hold
+their own lease, so both would act.
+
+A release publishes the chart as well, in the Helm repository at
+`https://raw.githubusercontent.com/petasus-ai/edgestack-helm/master/`, with
+the image of that release as its default. The chart version is the tag
+without its `v`. [docs/releasing.md](docs/releasing.md) describes how a
+release is cut.
 
 ## Contributing
 

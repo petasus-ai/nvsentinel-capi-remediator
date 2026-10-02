@@ -4,7 +4,7 @@ description: >-
   Turns NVSentinel GPU health signals from Cluster API workload clusters into
   Machine remediation on the management cluster.
 type: application
-# The release workflow will stamp both versions from the tag it is run for.
+# The release workflow stamps both versions from the tag it is run for.
 version: 0.1.0
 appVersion: v0.1.0
 home: https://github.com/petasus-ai/nvsentinel-capi-remediator

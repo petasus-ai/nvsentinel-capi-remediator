@@ -2,9 +2,9 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 - manager.yaml
-# The image manager.yaml calls "controller". The default is the image the
-# release workflow will publish; make deploy and make build-installer set
-# it to IMG instead.
+# The image manager.yaml calls "controller". The default is the latest
+# release; make deploy and make build-installer set it to IMG instead, and
+# every release carries an install.yaml rendered with its own image.
 images:
 - name: controller
   newName: quay.io/edgestack/nvsentinel-capi-remediator

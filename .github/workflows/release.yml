@@ -1,0 +1,257 @@
+name: release
+
+# A version tag publishes the image and the chart built from it. See
+# docs/releasing.md.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+# One run per tag at a time, and a run in progress is never cancelled: a
+# release that is half published is finished by running it again, not by
+# starting over.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: quay.io/edgestack/nvsentinel-capi-remediator
+  # The Helm repository the chart is published in: a git repository that
+  # serves the packages on its default branch and rebuilds its index when
+  # one is pushed.
+  CHART_REPOSITORY: petasus-ai/edgestack-helm
+  CHART_REPOSITORY_BRANCH: master
+
+jobs:
+  # Nothing is published from a tree that does not pass. The checks run in a
+  # job of their own, which is given no secret and a read-only token, so
+  # that nothing they execute can reach a credential that publishes.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify
+        run: make verify
+
+  release:
+    name: publish image and chart
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Creating the GitHub release.
+      contents: write
+    env:
+      # Whether the secrets are there, not what they are: each one is only
+      # given to the step that uses it.
+      HAVE_IMAGE_ACCOUNT: ${{ secrets.QUAY_USER_NAME != '' && secrets.QUAY_PASSWORD != '' }}
+      HAVE_CHART_TOKEN: ${{ secrets.MY_TOKEN != '' }}
+    steps:
+      # The trigger pattern is loose, and the tag ends up in image and file
+      # names and on command lines, so it is held to a strict version first.
+      # A missing secret is found here rather than after half of the release
+      # is out.
+      - name: Check the tag and the secrets
+        run: |
+          if ! printf '%s\n' "$GITHUB_REF_NAME" |
+            grep -Eqx 'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?'; then
+            echo "$GITHUB_REF_NAME is not a release tag such as v0.1.0 or v0.1.0-rc.1"
+            exit 1
+          fi
+          if [ "$HAVE_IMAGE_ACCOUNT" != true ] || [ "$HAVE_CHART_TOKEN" != true ]; then
+            echo "the secrets QUAY_USER_NAME, QUAY_PASSWORD and MY_TOKEN are not all set for this repository"
+            exit 1
+          fi
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The job that publishes does not restore a build cache: what is in it
+      # was written by other runs.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Only the newest release is the latest one, for the image tag and on
+      # GitHub: not a pre-release, and not a patch to an earlier release
+      # line.
+      - name: Compare with the other releases
+        id: position
+        run: |
+          newest="$(git ls-remote --tags --refs origin 'v*' | sed 's|.*refs/tags/||' |
+            { grep -Ex 'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)' || true; } |
+            sort -V | tail -n 1)"
+          if [ "$newest" = "$GITHUB_REF_NAME" ]; then
+            echo "newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+            echo "$GITHUB_REF_NAME is not the newest release (${newest:-there is none yet})"
+          fi
+
+      # The chart and the installer are built before a credential that
+      # publishes is given to any step.
+      - name: Package the chart and render the installer
+        run: |
+          VERSION="$GITHUB_REF_NAME" make chart-package
+          make build-installer IMG="$IMAGE:$GITHUB_REF_NAME"
+
+      # The chart repository is public, so reading it needs no credential.
+      # The token that can push to it is only given to the step that pushes.
+      - name: Check out the chart repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.CHART_REPOSITORY }}
+          ref: ${{ env.CHART_REPOSITORY_BRANCH }}
+          path: chart-repository
+          persist-credentials: false
+
+      # A published chart is never replaced: its users would get different
+      # contents under the same version. The same contents mean an earlier
+      # run of this release already published it, which a rerun skips; the
+      # published package then replaces the one just built, so that the
+      # GitHub release carries the very file the Helm repository serves.
+      - name: Compare with the published chart
+        id: chart
+        run: |
+          package="nvsentinel-capi-remediator-${GITHUB_REF_NAME#v}.tgz"
+          if [ ! -e "chart-repository/$package" ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/published" "$RUNNER_TEMP/built"
+          tar -xzf "chart-repository/$package" -C "$RUNNER_TEMP/published"
+          tar -xzf "dist/$package" -C "$RUNNER_TEMP/built"
+          if ! diff -r "$RUNNER_TEMP/published" "$RUNNER_TEMP/built"; then
+            echo "$package is already in $CHART_REPOSITORY with other contents"
+            exit 1
+          fi
+          cp "chart-repository/$package" "dist/$package"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to quay.io
+        env:
+          QUAY_USER_NAME: ${{ secrets.QUAY_USER_NAME }}
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: printf '%s' "$QUAY_PASSWORD" | docker login quay.io --username "$QUAY_USER_NAME" --password-stdin
+
+      # A multi-platform build needs the docker-container driver; the
+      # runner's default docker driver builds for one platform only.
+      - name: Create a multi-platform builder
+        run: docker buildx create --use
+
+      # An image that is already there was pushed by an earlier run of this
+      # release. Building it again would move the tag to another digest
+      # after the chart naming it may have gone out. A tag that is absent
+      # is reported as "not found". A repository that does not exist yet,
+      # which the first push creates, is reported that way or as "401
+      # Unauthorized", depending on what the account may read; after the
+      # login above, that answer cannot hide a tag this account pushed. A
+      # lookup that fails in another way stops the release.
+      - name: Build and push the image
+        run: |
+          if out="$(docker buildx imagetools inspect "$IMAGE:$GITHUB_REF_NAME" 2>&1)"; then
+            echo "$IMAGE:$GITHUB_REF_NAME is already published"
+            exit 0
+          fi
+          case "$out" in
+            *": not found"* | *"401 Unauthorized"*) ;;
+            *) printf '%s\n' "$out"; exit 1 ;;
+          esac
+          make docker-buildx IMG="$IMAGE:$GITHUB_REF_NAME"
+
+      # The chart names this image and its users pull it without
+      # credentials, which a repository the first push created may not
+      # allow. The release stops here until the repository is public, and a
+      # rerun carries on from this step.
+      - name: Check that the image can be pulled without credentials
+        run: |
+          url="https://${IMAGE%%/*}/v2/${IMAGE#*/}/manifests/$GITHUB_REF_NAME"
+          accept="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 -H "Accept: $accept" "$url" || true)"
+          case "$status" in
+            200) ;;
+            401 | 403)
+              echo "$IMAGE:$GITHUB_REF_NAME cannot be pulled without credentials (HTTP $status)"
+              echo "make the image repository public and run this workflow again"
+              exit 1
+              ;;
+            *)
+              echo "could not check $IMAGE:$GITHUB_REF_NAME (HTTP $status); run this workflow again"
+              exit 1
+              ;;
+          esac
+
+      # latest is what the kustomize manifests default to.
+      - name: Point latest at the release
+        if: steps.position.outputs.newest == 'true'
+        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$GITHUB_REF_NAME"
+
+      # Nothing after this needs the registry account.
+      - name: Log out of quay.io
+        run: docker logout quay.io
+
+      - name: Publish the chart
+        if: steps.chart.outputs.published != 'true'
+        env:
+          MY_TOKEN: ${{ secrets.MY_TOKEN }}
+        run: |
+          package="nvsentinel-capi-remediator-${GITHUB_REF_NAME#v}.tgz"
+          cp "dist/$package" chart-repository/
+          cd chart-repository
+          git config user.name "edgestack-bot"
+          git config user.email "edgestack-bot@users.noreply.github.com"
+          git add "$package"
+          git commit -m "$package"
+          # The token is sent as a header of the push alone and is never
+          # written to the repository's configuration.
+          auth="$(printf 'x-access-token:%s' "$MY_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          # The repository commits its index after every chart, and other
+          # charts are published to it, so the branch may have moved.
+          for _ in 1 2 3; do
+            if git pull --rebase origin "$CHART_REPOSITORY_BRANCH" &&
+              git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+                push origin "HEAD:$CHART_REPOSITORY_BRANCH"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "could not push $package to $CHART_REPOSITORY"
+          exit 1
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEWEST: ${{ steps.position.outputs.newest }}
+        run: |
+          # gh creates a release as a draft and publishes it once the files
+          # are attached, so a draft is what a run stopped in between left.
+          if draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$draft" != true ]; then
+              echo "the release $GITHUB_REF_NAME already exists"
+              exit 0
+            fi
+            gh release delete "$GITHUB_REF_NAME" --yes
+          fi
+          options=(--verify-tag --generate-notes "--latest=$NEWEST")
+          case "$GITHUB_REF_NAME" in *-*) options+=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" "${options[@]}" \
+            dist/install.yaml "dist/nvsentinel-capi-remediator-${GITHUB_REF_NAME#v}.tgz"
