@@ -110,19 +110,31 @@ operator's answer in the request's `ExternalRemediationComplete` condition.
 | `False` | `ControlPlaneMachine`, `MachineOptedOutOfRemediation` | The operator never touches such a Machine. |
 | none | | A replacement: the node is deleted with its Machine and the request with the node. Also while the Machine is paused, being deleted or already marked, and while the checks that could act are paused. |
 
-NVSentinel does nothing on `False`: the node stays cordoned and released, on
-the grounds that an external system which gave up may have left it in any
-state. That lasts until the request is deleted, which NVSentinel does itself
-once the request's TTL has passed. To hand such a node back sooner, once you
-have looked at it, delete the request in the workload cluster:
+NVSentinel does not take the node back on `False`: it stays cordoned and
+released, on the grounds that an external system which gave up may have left
+it in any state. It stays released until the request is deleted, which
+NVSentinel does itself once the request's TTL has passed. To hand such a
+node back sooner, once you have looked at it, delete the request in the
+workload cluster:
 
 ```
 kubectl delete externalremediationrequest <name>
 ```
 
-NVSentinel's cleanup removes the release taint and its monitors return to the
-node. A fault that is still there is detected again and produces a new
-request.
+NVSentinel's cleanup removes the release taint, and its monitors return to
+the node. That does not uncordon it. The node stays cordoned for as long as
+the fault is reported, and a fault NVSentinel read from the kernel log stays
+reported until the node has booted again.
+
+Whether a new request follows depends on how the fault is found. One read
+from the kernel log gets none: NVSentinel has read the line and does not
+read it again. One that a returning monitor still measures, as the GPU
+health monitor does through DCGM, is reported anew and gets a new request,
+and so does any fault the kernel logged while the node was released. Where
+none follows, what is left is yours to decide: restart or replace the node,
+or uncordon it if the fault turned out to be nothing, which NVSentinel takes
+as the end of the quarantine. A fault that occurs again produces a new
+request, which is handled like any other.
 
 ## Undoing a mark
 

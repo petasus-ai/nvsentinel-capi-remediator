@@ -101,9 +101,8 @@ decisions:
   and an entry for any other action has no effect. Where NVSentinel's
   janitor remediates, nothing is acted on whatever the table says.
 - Mapping an action that is routed to requests to `report` declines every
-  such request: the answer is `False`, and the node stays cordoned and
-  released until the request is deleted; see
-  [operations.md](operations.md#how-requests-are-answered).
+  such request: the answer is `False`, which leaves the node cordoned and
+  released; see [operations.md](operations.md#how-requests-are-answered).
 - The defaults report everything a restart or a replacement is not known to
   fix. Before mapping such an action to one, check what raises it in your
   clusters: a fault that a new node inherits, or a false positive, then costs
