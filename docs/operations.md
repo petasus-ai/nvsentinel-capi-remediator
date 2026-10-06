@@ -108,7 +108,7 @@ operator's answer in the request's `ExternalRemediationComplete` condition.
 | `False` | `MachineNotFound` | No Machine owns the node. |
 | `False` | `RemediationUnavailable` | No MachineHealthCheck can carry out the decision, not even once paused ones are unpaused. |
 | `False` | `ControlPlaneMachine`, `MachineOptedOutOfRemediation` | The operator never touches such a Machine. |
-| none | | A replacement: the node is deleted with its Machine and the request with the node. Also while the Machine is paused, being deleted or already marked, and while the checks that could act are paused. |
+| none | | A replacement: the node is deleted with its Machine and the request with the node. Also while the Machine is paused, being deleted or already marked, while the checks that could act are paused, and while a restart is held back for the checks to drop the Machine's earlier mark. |
 
 NVSentinel does not take the node back on `False`: it stays cordoned and
 released, on the grounds that an external system which gave up may have left
@@ -147,10 +147,11 @@ kubectl -n <cluster-namespace> annotate machine <machine> \
   cluster.x-k8s.io/remediate-machine- \
   nvsentinel.petasus.io/remediation-reason- \
   nvsentinel.petasus.io/remediation-action- \
-  nvsentinel.petasus.io/remediation-boot-id-
+  nvsentinel.petasus.io/remediation-boot-id- \
+  nvsentinel.petasus.io/remediation-request-
 ```
 
-The operator marks the Machine again on its next poll while the signal
+The operator marks the Machine again at a later poll while the signal
 persists, so clear the signal first or set
 `cluster.x-k8s.io/skip-remediation` on the Machine. On a cluster read by
 requests, clearing the signal means deleting the request, and opting the
@@ -171,7 +172,9 @@ The first and the last log line below are logged at debug level; add
 |---|---|
 | `workload cluster is not connected, waiting` | The Cluster's infrastructure is not provisioned yet, its kubeconfig Secret is missing, or its API server is unreachable. The cluster is polled again once Cluster API's cluster cache connects. |
 | `selecting the signal source failed, will retry` | Discovery against the workload API server failed, as it does during an upgrade. |
-| `watching the requests failed, they are read at every poll only` | The watch that has a request acted on at once could not be added, usually because the connection to the workload cluster was lost at that moment. Requests are still read at every poll, and the watch is tried again then. |
+| `remediation skipped` with `skip` `AlreadyMarkedForRemediation` | The Machine is marked already and Cluster API is working through it. For a request on a cluster read by requests it can also mean that the mark is left from a restart another request asked for: that restart does not answer this one, the mark is removed in the same poll, and the request gets a restart of its own. |
+| `remediation skipped` with `skip` `EarlierRemediationNotCleared` | A restart is called for, and the Machine's `HealthCheckSucceeded` condition still names a `remediate-machine` annotation it no longer carries. That usually means a MachineHealthCheck still holds the remediation request of the mark before, and a restart asked for now would be counted against that one. The restart is held back until the condition is rewritten, and for about a minute at most from when the operator first saw it, counted anew after a restart of the operator and after the Cluster was paused or out of reach: a check that has no such request to drop leaves the condition alone, so it can stay. `the checks still show the mark the Machine carried before, not holding the restart back` is logged when the minute is what ended the wait. |
+| `watching the requests failed, they are read at every poll only` | The watch that has a request read at once could not be added, usually because the connection to the workload cluster was lost at that moment. Requests are still read at every poll, and the watch is tried again then. |
 | `collecting signals failed, will retry`, `reading nodes failed, will retry`, `reaching the workload cluster failed, will retry`, `reading the request failed, will retry` | A read from the workload cluster failed. No mark is removed on such a poll because its signal seems gone; a request that could not be read is tried again on the next. |
 | nothing at all for a cluster | It does not match `--cluster-selector`, or it is being deleted. |
 | nothing, or only reports, for a cluster whose NVSentinel no longer runs the janitor | The janitor's CRDs are still installed: Helm leaves them behind, and they keep the cluster in the mode they imply. Delete them and restart the operator to have node conditions acted on again: a removed resource is only noticed when the operator reconnects to the cluster. |

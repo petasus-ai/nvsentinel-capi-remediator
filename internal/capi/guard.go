@@ -16,7 +16,11 @@ limitations under the License.
 
 package capi
 
-import clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+import (
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+)
 
 // SkipReason names why a Machine was left untouched. The zero value means
 // the Machine may be remediated.
@@ -45,6 +49,11 @@ const (
 	// remediate-machine annotation would do nothing until someone removes
 	// the opt-out and then act at an arbitrary time.
 	SkipOptedOut SkipReason = "MachineOptedOutOfRemediation"
+	// SkipEarlierMark the Machine is no longer marked, but its
+	// MachineHealthChecks may still hold what they kept for the mark it
+	// carried (see EarlierMarkPending). A restart is held back a while for
+	// them to drop it.
+	SkipEarlierMark SkipReason = "EarlierRemediationNotCleared"
 )
 
 // Message explains the reason in a clause, for logs and Events.
@@ -60,6 +69,8 @@ func (s SkipReason) Message() string {
 		return "the Machine is paused"
 	case SkipOptedOut:
 		return "the Machine has opted out of remediation"
+	case SkipEarlierMark:
+		return "the MachineHealthChecks still show the mark the Machine carried before"
 	default:
 		return string(s)
 	}
@@ -92,6 +103,36 @@ func Guard(m *clusterv1.Machine) SkipReason {
 	default:
 		return ""
 	}
+}
+
+// EarlierMarkPending reports whether the Machine's HealthCheckSucceeded
+// condition still names a remediate-machine annotation the Machine no
+// longer carries: no check has rewritten the condition since the mark was
+// removed.
+//
+// That is the usual sign that a check still holds the provider's
+// remediation request of the earlier mark. A check that remediates through
+// a template drops that request, and rewrites the condition with it, when
+// it next finds the Machine healthy, and it looks at intervals, not at
+// every change. A mark set again before that is taken for the old one: the
+// earlier request stays, and a provider that has already restarted the
+// Machine for it gives the Machine up instead of restarting it again.
+//
+// It is a sign and not proof, in both directions. Such a check leaves the
+// condition of a healthy Machine alone when it has no request to delete
+// for it, so a Machine whose earlier mark never led to one, or lost it
+// some other way, can keep the condition for good; whoever waits on this
+// must not wait without end. And the condition may read cleared while a
+// request is still there, as when several checks cover the Machine, the
+// request has a finalizer, or a check is over its limit of unhealthy
+// Machines, which has it rewrite the condition and delete nothing.
+func EarlierMarkPending(m *clusterv1.Machine) bool {
+	if IsMarkedForRemediation(m) {
+		return false
+	}
+	c := meta.FindStatusCondition(m.Status.Conditions, clusterv1.MachineHealthCheckSucceededCondition)
+
+	return c != nil && c.Status == metav1.ConditionFalse && c.Reason == clusterv1.MachineHealthCheckHasRemediateAnnotationReason
 }
 
 // IsControlPlane reports whether the Machine belongs to the control plane.

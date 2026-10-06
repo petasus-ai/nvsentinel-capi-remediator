@@ -117,7 +117,9 @@ Notes on that configuration:
 3. For a restart, once the node is Ready with a new boot ID the operator
    sets `ExternalRemediationComplete` to `True`, at its next poll. The
    janitor removes the taint and the label, the monitors return, and
-   NVSentinel uncordons the node once its checks pass.
+   NVSentinel uncordons the node once its checks pass. A restart answers
+   the request it was asked for and no other: a request raised for the node
+   after it is back gets a restart of its own.
 4. For a replacement the node is deleted with its Machine, and the request
    goes with the node.
 

@@ -57,6 +57,9 @@ const (
 
 var clusterKey = client.ObjectKey{Namespace: testNamespace, Name: testCluster}
 
+// fixtureTime is what a fixture's clock shows until a test steps it.
+var fixtureTime = time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+
 func newScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
@@ -224,6 +227,10 @@ func newFixture(t *testing.T, opts fixtureOptions, hubObjs []client.Object, node
 			PollInterval:    time.Minute,
 			ClusterSelector: opts.selector,
 			RestartFallback: opts.restartFallback,
+			// A clock that stands still, so that a pass that holds a
+			// restart back comes back after a whole wait, which is the
+			// poll interval here. Tests about the wait step their own.
+			now: func() time.Time { return fixtureTime },
 		},
 	}
 }

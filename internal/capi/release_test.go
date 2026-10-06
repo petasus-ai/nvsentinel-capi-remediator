@@ -70,7 +70,7 @@ func TestMarkThenReleaseRoundTrips(t *testing.T) {
 	})
 	a, rec := newActuator(t, m)
 
-	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, ""); err != nil {
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, RestartRecord{}); err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
 	<-rec.Events
@@ -241,7 +241,7 @@ func TestMarkRecordsTheBootIDAndReleaseRemovesIt(t *testing.T) {
 	m := newMachine("w")
 	a, rec := newActuator(t, m)
 
-	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, "boot-1"); err != nil {
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, RestartRecord{BootID: "boot-1"}); err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
 	if got := stored(t, a.Client, m).Annotations[RemediationBootIDAnnotation]; got != "boot-1" {
@@ -257,11 +257,90 @@ func TestMarkRecordsTheBootIDAndReleaseRemovesIt(t *testing.T) {
 	}
 }
 
+func TestMarkRecordsTheRequestAndReleaseRemovesIt(t *testing.T) {
+	m := newMachine("w")
+	a, rec := newActuator(t, m)
+
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, RestartRecord{BootID: "boot-1", Request: "extrr-1"}); err != nil {
+		t.Fatalf("MarkForRemediation: %v", err)
+	}
+	if got := stored(t, a.Client, m).Annotations[RemediationRequestAnnotation]; got != "extrr-1" {
+		t.Fatalf("recorded request = %q, want extrr-1", got)
+	}
+	<-rec.Events
+
+	if _, err := a.Release(context.Background(), m, releaseReason); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if _, ok := stored(t, a.Client, m).Annotations[RemediationRequestAnnotation]; ok {
+		t.Fatal("request left behind")
+	}
+}
+
+func TestMarkWithoutRequestRecordsNone(t *testing.T) {
+	m := newMachine("w")
+	a, _ := newActuator(t, m)
+
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, RestartRecord{BootID: "boot-1"}); err != nil {
+		t.Fatalf("MarkForRemediation: %v", err)
+	}
+	if _, ok := stored(t, a.Client, m).Annotations[RemediationRequestAnnotation]; ok {
+		t.Fatal("a request recorded for a mark made for none")
+	}
+}
+
+func TestRestartAnswers(t *testing.T) {
+	askedFor := func(request string) *clusterv1.Machine {
+		return newMachine("w", markedBy(ActionRestart), func(m *clusterv1.Machine) {
+			m.Annotations[RemediationRequestAnnotation] = request
+		})
+	}
+	tests := []struct {
+		name    string
+		machine *clusterv1.Machine
+		want    bool
+	}{
+		{"the request the restart was asked for", askedFor("extrr-1"), true},
+		{"another request", askedFor("extrr-0"), false},
+		// Made by an earlier version, which did not record the request, or for a node
+		// condition.
+		{"a mark that names no request", newMachine("w", markedBy(ActionRestart)), true},
+		{"a Machine without annotations", newMachine("w"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RestartAnswers(tt.machine, "extrr-1"); got != tt.want {
+				t.Fatalf("RestartAnswers() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// What was recorded for a restart says nothing about a replacement.
+func TestEscalateDropsWhatWasRecordedForTheRestart(t *testing.T) {
+	m := newMachine("w")
+	a, rec := newActuator(t, m)
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRestart, testReason, RestartRecord{BootID: "boot-1", Request: "extrr-1"}); err != nil {
+		t.Fatalf("MarkForRemediation: %v", err)
+	}
+	<-rec.Events
+
+	if escalated, err := a.Escalate(context.Background(), m, "a replacement is called for"); err != nil || !escalated {
+		t.Fatalf("Escalate = %v, %v; want escalated", escalated, err)
+	}
+	got := stored(t, a.Client, m)
+	for _, key := range []string{RemediationBootIDAnnotation, RemediationRequestAnnotation} {
+		if _, ok := got.Annotations[key]; ok {
+			t.Errorf("%s kept on a replacement mark", key)
+		}
+	}
+}
+
 func TestMarkWithoutBootIDRecordsNone(t *testing.T) {
 	m := newMachine("w")
 	a, _ := newActuator(t, m)
 
-	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, ""); err != nil {
+	if _, err := a.MarkForRemediation(context.Background(), m, ActionRemediate, testReason, RestartRecord{}); err != nil {
 		t.Fatalf("MarkForRemediation: %v", err)
 	}
 	if _, ok := stored(t, a.Client, m).Annotations[RemediationBootIDAnnotation]; ok {

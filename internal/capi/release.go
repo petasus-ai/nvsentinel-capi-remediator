@@ -68,6 +68,7 @@ func (a *Actuator) Release(ctx context.Context, m *clusterv1.Machine, reason str
 	delete(updated.Annotations, RemediationReasonAnnotation)
 	delete(updated.Annotations, RemediationActionAnnotation)
 	delete(updated.Annotations, RemediationBootIDAnnotation)
+	delete(updated.Annotations, RemediationRequestAnnotation)
 
 	// The resource version makes the patch fail rather than remove an
 	// annotation someone else set again after the Machine was read.
@@ -107,6 +108,18 @@ func RestartCompleted(m *clusterv1.Machine, node *corev1.Node) bool {
 	return false
 }
 
+// RestartAnswers reports whether the restart the Machine is marked for is
+// the one to answer the request with. It is when the mark was made for that
+// request, and when the mark names none: it was then made by an earlier
+// version of this operator, which did not record the request, or for a
+// node condition, and is credited to whichever request waits, as it was
+// before requests were recorded.
+func RestartAnswers(m *clusterv1.Machine, request string) bool {
+	asked := m.Annotations[RemediationRequestAnnotation]
+
+	return asked == "" || asked == request
+}
+
 // Escalate turns this operator's restart mark into a replacement mark, so
 // that the Machine is never released: a replacement stays requested until
 // Cluster API replaces the Machine, even once a restart has lowered the
@@ -122,9 +135,12 @@ func (a *Actuator) Escalate(ctx context.Context, m *clusterv1.Machine, reason st
 		return true, nil
 	}
 
+	// What was recorded for the restart says nothing about a replacement.
 	updated := m.DeepCopy()
 	updated.Annotations[RemediationActionAnnotation] = ActionRemediate
 	updated.Annotations[RemediationReasonAnnotation] = reason
+	delete(updated.Annotations, RemediationBootIDAnnotation)
+	delete(updated.Annotations, RemediationRequestAnnotation)
 
 	if err := a.Client.Patch(ctx, updated, client.MergeFromWithOptions(m, client.MergeFromWithOptimisticLock{})); err != nil {
 		return false, fmt.Errorf("patch machine %s/%s: %w", m.Namespace, m.Name, err)

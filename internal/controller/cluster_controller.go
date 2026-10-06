@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/util/annotations"
@@ -59,9 +60,18 @@ const ControllerName = "nvsentinel-capi-remediator"
 // when nothing else is configured. The sources are conditions and objects
 // that NVSentinel already debounces with its own check intervals, and the
 // reads are served from a per-cluster cache, so the interval stays coarse.
-// A request does not wait for it to be acted on (see watchRequests);
+// A request does not wait for it to be read (see watchRequests);
 // everything else does, including noticing that a restart has completed.
 const DefaultPollInterval = 2 * time.Minute
+
+// earlierMarkGrace is how long a restart is held back for the
+// MachineHealthChecks to drop what they hold for the mark the Machine
+// carried before (see capi.EarlierMarkPending). Cluster API runs a check at
+// most once in fifteen seconds, so a check that works has had its turn well
+// within it. One that has not rewritten the condition by then most likely
+// has nothing to drop, and waiting on would keep a faulty node out of
+// service for a sign that may never change.
+const earlierMarkGrace = time.Minute
 
 // requestWatchName names the watch on a workload cluster's
 // ExternalRemediationRequests in the cluster cache.
@@ -188,6 +198,12 @@ type ClusterReconciler struct {
 	// modes holds the mode each Cluster was last read in, so that a change
 	// is logged and recorded once.
 	modes map[client.ObjectKey]Mode
+	// waiting holds, per Cluster, the Machines a restart was held back for
+	// (see heldForChecks). It is lost on restart, which starts the waits
+	// over.
+	waiting map[client.ObjectKey]map[string]*checksWait
+	// now is the clock; time.Now when nil.
+	now func() time.Time
 
 	// requestWatcher is the controller that the watches on the workload
 	// clusters' requests are added to. SetupWithManager sets it.
@@ -253,9 +269,9 @@ func decline(sig signal.Signal, reason, message string) answer {
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile reads every signal of one workload cluster and acts on each.
-// It requeues itself every poll interval; the watches only shorten the
-// wait after a Cluster changes or connects, or NVSentinel releases a node
-// to a request.
+// It requeues itself every poll interval, or sooner while a restart is held
+// back for the Machine's checks; the watches only shorten the wait after a
+// Cluster changes or connects, or NVSentinel releases a node to a request.
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -282,6 +298,10 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// paused annotation is not, so keep polling to notice its removal.
 		// A poll of a paused Cluster is one cached Get.
 		log.V(1).Info("Cluster is paused, not collecting signals")
+		// Whatever paused the Cluster may have paused its checks too, as
+		// spec.paused does, so time spent paused is not counted as time
+		// they had.
+		r.forgetWaits(req.NamespacedName, nil)
 		return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
 	}
 
@@ -292,6 +312,10 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			// unreachable. The cluster cache enqueues the Cluster again the
 			// moment it connects.
 			log.V(1).Info("workload cluster is not connected, waiting")
+			// The checks may not reach the workload cluster either, in
+			// which case they remediate nothing, so this time is not
+			// counted as time they had.
+			r.forgetWaits(req.NamespacedName, nil)
 			return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
 		}
 
@@ -357,6 +381,10 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	previous := r.observations(req.NamespacedName)
 	current := make(map[string]observation, len(signals))
+	// asking are the requests found pending in this pass. The observations
+	// cannot stand in for them: they are kept by node and check, so one of
+	// two requests for the same check of a node replaces the other.
+	asking := map[string]bool{}
 	unreadable := false
 	for _, sig := range signals {
 		if sig.Request != "" {
@@ -372,6 +400,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if !pending {
 				continue
 			}
+			asking[sig.Request] = true
 		}
 
 		machine, node := machines[sig.Node], nodes[sig.Node]
@@ -384,11 +413,12 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// A request that could not be read may still hold its Machine, and
 	// nothing may be released on the strength of a partial read.
 	if !unreadable {
-		r.releaseRestarts(ctx, req.NamespacedName, source.Name(), machines, current)
+		r.releaseRestarts(ctx, req.NamespacedName, source.Name(), machines, nodes, current, asking)
 	}
 	r.remember(ctx, req.NamespacedName, previous, current)
+	r.forgetWaits(req.NamespacedName, machines)
 
-	return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
+	return ctrl.Result{RequeueAfter: r.nextLook(req.NamespacedName)}, nil
 }
 
 // handle decides one signal, acts on it and returns what was concluded. The
@@ -480,10 +510,17 @@ func (r *ClusterReconciler) remediate(
 	// so that a failed answer never leaves a pending request behind an
 	// unmarked Machine, which the next poll would restart again.
 	//
-	// Completion is judged for the node, not for the request that asked
-	// for the restart: a request raised while the node was going down is
-	// answered by the same restart, as the node it concerns has restarted.
-	if restart && sig.Request != "" && capi.RestartCompleted(machine, node) {
+	// A restart answers the request it was asked for and no other. A
+	// request that finds the mark of a restart that is over is treated as
+	// raised for a fault the restart did not cure, and answering it too
+	// would report a remediation that never happened: that mark is what a
+	// failed release left behind, or a restart of the operator between the
+	// answer and the release. Such a request is handled like any other
+	// that finds its Machine marked. Where it calls for a restart it waits,
+	// releaseRestarts removes the mark, and a later pass asks for a restart
+	// of its own; where the restart falls back to a replacement, the mark
+	// is turned into one below.
+	if restart && sig.Request != "" && capi.RestartCompleted(machine, node) && capi.RestartAnswers(machine, sig.Request) {
 		obs.Answer = answer{Complete: true, Reason: AnswerRestarted,
 			Message: fmt.Sprintf("node %s restarted and is Ready", sig.Node)}
 		if obs != previous {
@@ -582,6 +619,28 @@ func (r *ClusterReconciler) remediate(
 		return obs
 	}
 
+	// A restart is held back while the checks still show the mark the
+	// Machine carried before: they would take the new mark for the old one,
+	// and the provider would count this restart against the earlier one. A
+	// replacement does not wait, since it is what the provider arrives at
+	// either way.
+	if restart {
+		switch held, shown := r.heldForChecks(client.ObjectKeyFromObject(cluster), machine); {
+		case held:
+			obs.Skip = capi.SkipEarlierMark
+			if obs != previous {
+				log.Info("remediation skipped", "skip", obs.Skip, "why", obs.Skip.Message())
+			} else {
+				log.V(1).Info("remediation still skipped", "skip", obs.Skip)
+			}
+
+			return obs
+		case shown > 0:
+			log.Info("the checks still show the mark the Machine carried before, not holding the restart back",
+				"shownFor", shown.String())
+		}
+	}
+
 	// A Replace on a Machine whose checks all remediate through templates
 	// gets the provider's remediation first and a replacement only once
 	// that gives up; with any check remediating by replacement it is
@@ -594,14 +653,18 @@ func (r *ClusterReconciler) remediate(
 	}
 
 	// The node's boot ID is recorded with a restart, which is how its
-	// completion is told when the request it came from never clears.
-	bootID := ""
-	if restart && node != nil {
-		bootID = node.Status.NodeInfo.BootID
+	// completion is told when the request it came from never clears, and
+	// so is that request, which is the one the restart answers.
+	record := capi.RestartRecord{}
+	if restart {
+		record.Request = sig.Request
+		if node != nil {
+			record.BootID = node.Status.NodeInfo.BootID
+		}
 	}
 	// The actuator runs the same guards on the same object, so it cannot
 	// skip what passed them above.
-	if _, err := r.actuator().MarkForRemediation(ctx, machine, action, reason, bootID); err != nil {
+	if _, err := r.actuator().MarkForRemediation(ctx, machine, action, reason, record); err != nil {
 		log.Error(err, "marking Machine for remediation failed")
 		// Nothing was concluded; the next poll starts over.
 		return observation{}
@@ -648,6 +711,14 @@ func (r *ClusterReconciler) restartFallback(cluster *clusterv1.Cluster) (Restart
 // eventually replaced. Machines marked for a replacement stay marked
 // until Cluster API replaces them.
 //
+// A request holds the mark of the restart it asked for, and that of a
+// restart still under way, whoever asked for it. It does not hold the mark
+// of a restart that is over and was asked for by another request, unless
+// that request is itself still asking: such a restart cannot answer it (see
+// remediate), so the mark is released and the request gets a restart of its
+// own at a later pass, once the MachineHealthChecks have had the time to
+// drop what they hold for the earlier one (see heldForChecks).
+//
 // It runs only after the signals were collected successfully, so a
 // workload cluster that cannot be read never releases anything. A node
 // that disappears from the workload cluster takes its signals with it and
@@ -656,33 +727,64 @@ func (r *ClusterReconciler) restartFallback(cluster *clusterv1.Cluster) (Restart
 // every Machine this operator marks has, since it marks them through their
 // node.
 func (r *ClusterReconciler) releaseRestarts(
-	ctx context.Context, key client.ObjectKey, source string, machines map[string]*clusterv1.Machine, current map[string]observation,
+	ctx context.Context, key client.ObjectKey, source string,
+	machines map[string]*clusterv1.Machine, nodes map[string]*corev1.Node,
+	current map[string]observation, asking map[string]bool,
 ) {
-	held := map[string]bool{}
+	nodeOf := make(map[string]string, len(machines))
+	for node, m := range machines {
+		nodeOf[m.Name] = node
+	}
+	// held are the Machines a signal holds. leftover are those that carry
+	// the mark of a finished restart nobody asks for any more, with the
+	// request that waits for a restart of its own.
+	held, leftover := map[string]bool{}, map[string]string{}
 	for _, obs := range current {
-		if obs.Machine != "" && (obs.Decision == decision.Replace || obs.Decision == decision.Restart) {
-			held[obs.Machine] = true
+		if obs.Machine == "" || (obs.Decision != decision.Replace && obs.Decision != decision.Restart) {
+			continue
 		}
+		node := nodeOf[obs.Machine]
+		if m := machines[node]; m != nil && obs.Decision == decision.Restart && obs.Request != "" {
+			// A request that is still asking is the one the mark answers, or
+			// is yet to be answered by it; either way the mark stays.
+			asked := m.Annotations[capi.RemediationRequestAnnotation]
+			if asked != "" && !asking[asked] && capi.RestartCompleted(m, nodes[node]) {
+				// The first by name, should several wait, so that the
+				// record of the release reads the same every time.
+				if waiting, ok := leftover[obs.Machine]; !ok || obs.Request < waiting {
+					leftover[obs.Machine] = obs.Request
+				}
+				continue
+			}
+		}
+		held[obs.Machine] = true
 	}
 
 	wouldRelease := map[string]bool{}
 	defer r.rememberWouldRelease(key, wouldRelease)
 
-	nodes := make([]string, 0, len(machines))
+	names := make([]string, 0, len(machines))
 	for node := range machines {
-		nodes = append(nodes, node)
+		names = append(names, node)
 	}
-	slices.Sort(nodes)
+	slices.Sort(names)
 
-	for _, node := range nodes {
+	for _, node := range names {
 		m := machines[node]
 		if action, ok := capi.MarkedAction(m); !ok || action != capi.ActionRestart || held[m.Name] {
 			continue
 		}
 
 		log := ctrl.LoggerFrom(ctx).WithValues("node", node, "machine", m.Name, "dryRun", r.DryRun)
-		released, err := r.actuator().Release(ctx, m,
-			fmt.Sprintf("no %s signal this operator acts on calls for a restart or a replacement of node %s any more", source, node))
+		reason := fmt.Sprintf("no %s signal this operator acts on calls for a restart or a replacement of node %s any more", source, node)
+		why := "its restart signal cleared"
+		if waiting, ok := leftover[m.Name]; ok {
+			asked := m.Annotations[capi.RemediationRequestAnnotation]
+			reason = fmt.Sprintf("the restart of node %s that %s asked for is over, and %s waits for one of its own", node, asked, waiting)
+			why = "the restart it was marked for is over"
+			log = log.WithValues("askedBy", asked, "request", waiting)
+		}
+		released, err := r.actuator().Release(ctx, m, reason)
 		switch {
 		case err != nil:
 			// The next poll tries again.
@@ -692,10 +794,10 @@ func (r *ClusterReconciler) releaseRestarts(
 			if r.releasableBefore(key, m.Name) {
 				log.V(1).Info("would still release Machine from remediation")
 			} else {
-				log.Info("would release Machine from remediation, its restart signal cleared")
+				log.Info("would release Machine from remediation, " + why)
 			}
 		case released:
-			log.Info("Machine released from remediation, its restart signal cleared")
+			log.Info("Machine released from remediation, " + why)
 		}
 	}
 }
@@ -727,7 +829,8 @@ func reportOnly(mode Mode, d decision.Decision) string {
 // answer is written, which happens once: an answered request is no longer
 // pending. A failure is logged and the next poll answers again; a release
 // that fails after the answer is left to releaseRestarts, since the request
-// no longer holds the Machine. In dry run it only says, once, what it would
+// no longer holds the Machine, and until then the mark answers no other
+// request (see remediate). In dry run it only says, once, what it would
 // answer.
 func (r *ClusterReconciler) answer(
 	ctx context.Context, live client.Client, cluster *clusterv1.Cluster, machine *clusterv1.Machine,
@@ -765,9 +868,60 @@ func (r *ClusterReconciler) answer(
 		capi.EventNote(fmt.Sprintf("Answered %s %s: %s, %s: %s", extrr.GroupVersionKind.Kind, sig.Request, status, a.Reason, a.Message)))
 
 	if a.Complete && machine != nil {
-		if _, err := r.actuator().Release(ctx, machine, a.Message); err != nil {
+		if err := r.releaseAnswered(ctx, machine, a.Message); err != nil {
 			log.Error(err, "releasing Machine from remediation failed")
 		}
+	}
+}
+
+// releaseAnswered releases the Machine whose restart was just answered.
+// The Machine was read before the answer was written, and Cluster API
+// writes to it at just that time, as its node comes back. A release that
+// loses to such a write is tried again, a few times over a third of a
+// second, on the Machine as the manager's cache has it by then, as long as
+// that still carries the mark that was answered: a mark that has changed
+// since, or is gone, is someone else's doing and is left alone. The Machine
+// is brought up to date either way, for the signals handled after this one.
+func (r *ClusterReconciler) releaseAnswered(ctx context.Context, machine *clusterv1.Machine, reason string) error {
+	answered := restartMarkOf(machine)
+	conflicted := false
+
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		// Read after the wait, which is what gives the cache time to catch
+		// up with the write that won.
+		if conflicted {
+			current := &clusterv1.Machine{}
+			if err := r.Client.Get(ctx, client.ObjectKeyFromObject(machine), current); err != nil {
+				return client.IgnoreNotFound(err)
+			}
+			*machine = *current
+			if restartMarkOf(machine) != answered {
+				return nil
+			}
+		}
+
+		_, err := r.actuator().Release(ctx, machine, reason)
+		conflicted = apierrors.IsConflict(err)
+
+		// A Machine that is gone has nothing left to release.
+		return client.IgnoreNotFound(err)
+	})
+}
+
+// restartMark is what identifies the restart a Machine is marked for.
+type restartMark struct {
+	action, bootID, request string
+	marked                  bool
+}
+
+func restartMarkOf(m *clusterv1.Machine) restartMark {
+	action, marked := capi.MarkedAction(m)
+
+	return restartMark{
+		action:  action,
+		bootID:  m.Annotations[capi.RemediationBootIDAnnotation],
+		request: m.Annotations[capi.RemediationRequestAnnotation],
+		marked:  marked,
 	}
 }
 
@@ -903,6 +1057,110 @@ func (r *ClusterReconciler) forget(key client.ObjectKey) {
 	delete(r.seen, key)
 	delete(r.wouldRelease, key)
 	delete(r.modes, key)
+	delete(r.waiting, key)
+}
+
+// checksWait is the wait of one Machine for its checks.
+type checksWait struct {
+	// since is when the Machine was first seen unmarked with its checks
+	// still showing the earlier mark.
+	since time.Time
+	// over is set once the wait has been ended by its bound, which is said
+	// once.
+	over bool
+}
+
+// heldForChecks reports whether a restart of the Machine is to be held back
+// for its checks: they still show the mark it carried before, and have had
+// less than earlierMarkGrace to drop what they hold for it since that was
+// first seen here. The wait is bounded because the sign it goes by can stay
+// for good (see capi.EarlierMarkPending).
+//
+// The wait belongs to the Machine, not to the signal that ran into it: it
+// lasts for as long as the Machine stays that way (see forgetWaits), so
+// that a mark that fails, a dry run or the next signal does not start it
+// again. shown is how long the Machine has been seen that way, on the first
+// pass on which the bound lets a restart through, and zero otherwise.
+func (r *ClusterReconciler) heldForChecks(key client.ObjectKey, machine *clusterv1.Machine) (held bool, shown time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !capi.EarlierMarkPending(machine) {
+		delete(r.waiting[key], machine.Name)
+		return false, 0
+	}
+
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	wait := r.waiting[key][machine.Name]
+	if wait == nil {
+		if r.waiting == nil {
+			r.waiting = map[client.ObjectKey]map[string]*checksWait{}
+		}
+		if r.waiting[key] == nil {
+			r.waiting[key] = map[string]*checksWait{}
+		}
+		r.waiting[key][machine.Name] = &checksWait{since: now}
+
+		return true, 0
+	}
+	switch {
+	case now.Sub(wait.since) < earlierMarkGrace:
+		return true, 0
+	case wait.over:
+		return false, 0
+	default:
+		wait.over = true
+		return false, now.Sub(wait.since)
+	}
+}
+
+// nextLook is when the Cluster is to be reconciled again: at the next poll,
+// or when the first wait of one of its Machines is over, should that be
+// sooner.
+func (r *ClusterReconciler) nextLook(key client.ObjectKey) time.Duration {
+	next := r.pollInterval()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	for _, wait := range r.waiting[key] {
+		if left := earlierMarkGrace - now.Sub(wait.since); !wait.over && left > 0 && left < next {
+			next = left
+		}
+	}
+
+	return next
+}
+
+// forgetWaits drops the waits of the Cluster's Machines that are no longer
+// as they were when the wait began: marked again, seen unmarked by their
+// checks, or gone. Given no Machines it drops them all, which is for a
+// Cluster whose checks cannot have been at work.
+func (r *ClusterReconciler) forgetWaits(key client.ObjectKey, machines map[string]*clusterv1.Machine) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pending := map[string]bool{}
+	for _, m := range machines {
+		if capi.EarlierMarkPending(m) {
+			pending[m.Name] = true
+		}
+	}
+	for machine := range r.waiting[key] {
+		if !pending[machine] {
+			delete(r.waiting[key], machine)
+		}
+	}
+	if len(r.waiting[key]) == 0 {
+		delete(r.waiting, key)
+	}
 }
 
 // noteMode remembers the mode the Cluster is read in and, when that is new,

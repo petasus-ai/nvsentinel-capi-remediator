@@ -72,7 +72,7 @@ func main() {
 	flag.BoolVar(&dryRun, "dry-run", true,
 		"Log every decision but touch no Machine and record no Event.")
 	flag.DurationVar(&pollInterval, "poll-interval", controller.DefaultPollInterval,
-		"How often each workload cluster's signals are read. Requests are acted on as soon as their node is released.")
+		"How often each workload cluster's signals are read. Requests are read as soon as their node is released.")
 	flag.StringVar(&clusterSelector, "cluster-selector", "",
 		"Label selector limiting which Clusters are watched, e.g. environment=gpu. Empty selects every Cluster.")
 	flag.StringVar(&restartFallback, "restart-fallback", string(controller.RestartFallbackReport),

@@ -14,8 +14,8 @@ fullnameOverride: ""
 # clusters, and turn it off once the log shows the decisions you expect.
 dryRun: true
 
-# How often each workload cluster's signals are read. A request is acted on
-# as soon as NVSentinel releases its node, without waiting for a poll;
+# How often each workload cluster's signals are read. A request is read as
+# soon as NVSentinel releases its node, without waiting for a poll;
 # everything else is noticed at one, including that a restart has completed.
 pollInterval: 2m
 

@@ -57,6 +57,13 @@ const (
 	// reported when this operator asked for a restart. The restart has
 	// happened once the node reports another one.
 	RemediationBootIDAnnotation = AnnotationPrefix + "/remediation-boot-id"
+
+	// RemediationRequestAnnotation records the ExternalRemediationRequest a
+	// restart was asked for, when it was asked for one. The restart answers
+	// that request and no other: a request that finds the mark of a restart
+	// that is over is treated as raised for a fault the restart did not
+	// cure.
+	RemediationRequestAnnotation = AnnotationPrefix + "/remediation-request"
 )
 
 // Event reasons recorded on Machines. Annotations die with the Machine and

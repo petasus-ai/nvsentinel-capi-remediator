@@ -24,7 +24,7 @@ be set up in the workload clusters.
 | Flag | Chart value | Default | Meaning |
 |---|---|---|---|
 | `--dry-run` | `dryRun` | `true` | Log every decision and write nothing: no Machine is marked, no request answered, no Event recorded. |
-| `--poll-interval` | `pollInterval` | `2m` | How often each workload cluster's signals are read. A request is acted on as soon as NVSentinel releases its node, without waiting for a poll; everything else is noticed at one, including that a restart has completed. |
+| `--poll-interval` | `pollInterval` | `2m` | How often each workload cluster's signals are read. A request is read as soon as NVSentinel releases its node, without waiting for a poll; everything else is noticed at one, including that a restart has completed. |
 | `--cluster-selector` | `clusterSelector` | empty | Label selector for the Clusters to watch, e.g. `environment=gpu`. Empty selects every Cluster. Clusters it does not select are never connected to. |
 | `--restart-fallback` | `restartFallback` | `report` | What to do with a restart no remediation template can carry out: `report` it, or `replace` the Machine. |
 | `--decisions` | `decisions` | empty | Entries replacing those of the [decision table](#decisions), as comma-separated `ACTION=decision` pairs; in the chart, a map of action to decision. |
@@ -51,6 +51,7 @@ On a `Machine`:
 | `nvsentinel.petasus.io/remediation-reason` | the operator | A one-line description of the signal behind the mark. |
 | `nvsentinel.petasus.io/remediation-action` | the operator | `Remediate` or `Restart`. A `Restart` mark is removed again once the restart is over; a `Remediate` mark never is. |
 | `nvsentinel.petasus.io/remediation-boot-id` | the operator | The node's boot ID when a restart was asked for. |
+| `nvsentinel.petasus.io/remediation-request` | the operator | The request a restart was asked for. The restart answers that request and no other. |
 | `cluster.x-k8s.io/paused` | you / Cluster API | The Machine is left alone and looked at again on the next poll. |
 | `cluster.x-k8s.io/skip-remediation` | you | The Machine is never marked. |
 

@@ -135,8 +135,42 @@ func TestIsOptedOutUsesAnnotationPresence(t *testing.T) {
 	}
 }
 
+func TestEarlierMarkPending(t *testing.T) {
+	healthCheck := func(status metav1.ConditionStatus, reason string) func(*clusterv1.Machine) {
+		return func(m *clusterv1.Machine) {
+			m.Status.Conditions = append(m.Status.Conditions, metav1.Condition{
+				Type: clusterv1.MachineHealthCheckSucceededCondition, Status: status, Reason: reason,
+			})
+		}
+	}
+	sawTheMark := healthCheck(metav1.ConditionFalse, clusterv1.MachineHealthCheckHasRemediateAnnotationReason)
+	marked := func(m *clusterv1.Machine) {
+		m.Annotations = map[string]string{clusterv1.RemediateMachineAnnotation: ""}
+	}
+
+	tests := []struct {
+		name    string
+		machine *clusterv1.Machine
+		want    bool
+	}{
+		{"the checks last saw the mark that is gone", newMachine("w", sawTheMark), true},
+		// The condition is right while the mark is there.
+		{"still marked", newMachine("w", sawTheMark, marked), false},
+		{"the checks have seen it unmarked", newMachine("w", healthCheck(metav1.ConditionTrue, "Succeeded")), false},
+		{"unhealthy for another reason", newMachine("w", healthCheck(metav1.ConditionFalse, "UnhealthyNode")), false},
+		{"never checked", newMachine("w"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := EarlierMarkPending(tt.machine); got != tt.want {
+				t.Fatalf("EarlierMarkPending() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSkipReasonMessage(t *testing.T) {
-	known := []SkipReason{SkipDeleting, SkipAlreadyMarked, SkipControlPlane, SkipPaused, SkipOptedOut}
+	known := []SkipReason{SkipDeleting, SkipAlreadyMarked, SkipControlPlane, SkipPaused, SkipOptedOut, SkipEarlierMark}
 	seen := map[string]SkipReason{}
 	for _, s := range known {
 		msg := s.Message()

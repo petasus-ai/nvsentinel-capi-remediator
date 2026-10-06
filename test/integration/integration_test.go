@@ -320,8 +320,8 @@ func TestRemediation(t *testing.T) {
 
 		eventually(t, "the Machine to be marked for a restart", func() (bool, string) {
 			m := getMachine(ctx, t, "gpu-w-4")
-			return capi.IsMarkedForRemediation(m) && m.Annotations[capi.RemediationBootIDAnnotation] == "boot-1",
-				fmt.Sprint(m.Annotations)
+			return capi.IsMarkedForRemediation(m) && m.Annotations[capi.RemediationBootIDAnnotation] == "boot-1" &&
+				m.Annotations[capi.RemediationRequestAnnotation] == "extrr-restart", fmt.Sprint(m.Annotations)
 		})
 		consistently(t, "the restart to stay open until the node restarts", func() (bool, string) {
 			status, reason := answer(ctx, t, "extrr-restart")
