@@ -31,6 +31,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -41,6 +42,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/capi"
@@ -56,7 +59,13 @@ const ControllerName = "nvsentinel-capi-remediator"
 // when nothing else is configured. The sources are conditions and objects
 // that NVSentinel already debounces with its own check intervals, and the
 // reads are served from a per-cluster cache, so the interval stays coarse.
+// A request does not wait for it to be acted on (see watchRequests);
+// everything else does, including noticing that a restart has completed.
 const DefaultPollInterval = 2 * time.Minute
+
+// requestWatchName names the watch on a workload cluster's
+// ExternalRemediationRequests in the cluster cache.
+const requestWatchName = ControllerName + "-watchRequests"
 
 // Event reasons and actions recorded by the controller, next to those in
 // package capi.
@@ -179,6 +188,10 @@ type ClusterReconciler struct {
 	// modes holds the mode each Cluster was last read in, so that a change
 	// is logged and recorded once.
 	modes map[client.ObjectKey]Mode
+
+	// requestWatcher is the controller that the watches on the workload
+	// clusters' requests are added to. SetupWithManager sets it.
+	requestWatcher clustercache.SourceWatcher[ctrl.Request]
 }
 
 // observation is the conclusion reached about one signal. It deliberately
@@ -241,7 +254,8 @@ func decline(sig signal.Signal, reason, message string) answer {
 
 // Reconcile reads every signal of one workload cluster and acts on each.
 // It requeues itself every poll interval; the watches only shorten the
-// wait after a Cluster changes or connects.
+// wait after a Cluster changes or connects, or NVSentinel releases a node
+// to a request.
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -292,6 +306,13 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
 	}
 	r.noteMode(log, cluster, mode)
+
+	if mode == ModeExternalRemediationRequest {
+		if err := r.watchRequests(ctx, req.NamespacedName); err != nil {
+			// The poll reads the requests whether or not they are watched.
+			log.Info("watching the requests failed, they are read at every poll only", "error", err.Error())
+		}
+	}
 
 	source := mode.source(workload)
 	signals, err := source.Collect(ctx)
@@ -940,9 +961,61 @@ func (r *ClusterReconciler) rememberWouldRelease(key client.ObjectKey, machines 
 	r.wouldRelease[key] = machines
 }
 
+// watchRequests has the workload cluster's requests wake the Cluster's
+// reconcile the moment one becomes this operator's to act on, instead of at
+// the next poll. The cluster cache adds a watch of one name once per
+// connection to a workload cluster and loses it with the connection, so
+// this is called on every reconcile. The watch is served by the informer
+// that the cached client already lists the requests from, so it opens no
+// further connection to the workload cluster.
+//
+// Only a cluster in ModeExternalRemediationRequest is watched: a watch on a
+// resource that the cluster does not serve keeps retrying, and logging an
+// error, until the resource is served or the manager stops, whatever
+// becomes of the connection it was added on.
+func (r *ClusterReconciler) watchRequests(ctx context.Context, cluster client.ObjectKey) error {
+	if r.requestWatcher == nil {
+		return errors.New("the controller was not set up with a manager, so there is nothing to wake")
+	}
+
+	request := &unstructured.Unstructured{}
+	request.SetGroupVersionKind(extrr.GroupVersionKind)
+
+	return r.ClusterCache.Watch(ctx, cluster, clustercache.NewWatcher(clustercache.WatcherOptions{
+		Name:    requestWatchName,
+		Watcher: r.requestWatcher,
+		Kind:    request,
+		EventHandler: handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []ctrl.Request {
+			return []ctrl.Request{{NamespacedName: cluster}}
+		}),
+		Predicates: []predicate.Predicate{requestBecamePending()},
+	}))
+}
+
+// requestBecamePending passes the events that make a request this
+// operator's to act on: a request that is pending when it is first seen,
+// which is every pending one when the watch starts, and one that becomes
+// pending, which is NVSentinel releasing its node. Everything else about a
+// request is left to the poll: an answer is this operator's own write, and
+// a request that is deleted has nothing to be done for it that cannot wait.
+func requestBecamePending() predicate.Predicate {
+	pending := func(o client.Object) bool {
+		request, ok := o.(*unstructured.Unstructured)
+		return ok && extrr.Pending(request)
+	}
+
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return pending(e.Object) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return !pending(e.ObjectOld) && pending(e.ObjectNew) },
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
 // SetupWithManager registers the controller. It reconciles on Cluster
 // creation, spec changes and paused transitions, and whenever the cluster
-// cache connects to or loses a workload cluster; otherwise it polls. The
+// cache connects to or loses a workload cluster; otherwise it polls, apart
+// from the requests Reconcile has it watch (see watchRequests). The
 // selector filter does not reach the cluster cache's source, so Reconcile
 // checks the selector again; the manager's own cache is restricted to the
 // selector too, which keeps unselected Clusters out of both.
@@ -964,7 +1037,13 @@ func (r *ClusterReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manag
 		}))
 	}
 
-	return b.Complete(r)
+	c, err := b.Build(r)
+	if err != nil {
+		return err
+	}
+	r.requestWatcher = c
+
+	return nil
 }
 
 // clusterToRequest maps a Cluster event from the cluster cache to its own

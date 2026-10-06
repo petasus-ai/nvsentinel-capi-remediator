@@ -111,12 +111,13 @@ Notes on that configuration:
    labels it `nvsentinel.dgxc.nvidia.com/managed=false`, which takes
    NVSentinel's monitors off it, and sets the request's
    `NVSentinelOwnershipReleased` condition to `True`.
-2. The operator reads the request on its next poll, decides, and marks the
-   Machine in the management cluster.
+2. The operator watches the requests, so it reads this one as soon as the
+   node is released, decides, and marks the Machine in the management
+   cluster.
 3. For a restart, once the node is Ready with a new boot ID the operator
-   sets `ExternalRemediationComplete` to `True`. The janitor removes the
-   taint and the label, the monitors return, and NVSentinel uncordons the
-   node once its checks pass.
+   sets `ExternalRemediationComplete` to `True`, at its next poll. The
+   janitor removes the taint and the label, the monitors return, and
+   NVSentinel uncordons the node once its checks pass.
 4. For a replacement the node is deleted with its Machine, and the request
    goes with the node.
 

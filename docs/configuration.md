@@ -24,7 +24,7 @@ be set up in the workload clusters.
 | Flag | Chart value | Default | Meaning |
 |---|---|---|---|
 | `--dry-run` | `dryRun` | `true` | Log every decision and write nothing: no Machine is marked, no request answered, no Event recorded. |
-| `--poll-interval` | `pollInterval` | `2m` | How often each workload cluster's signals are read. |
+| `--poll-interval` | `pollInterval` | `2m` | How often each workload cluster's signals are read. A request is acted on as soon as NVSentinel releases its node, without waiting for a poll; everything else is noticed at one, including that a restart has completed. |
 | `--cluster-selector` | `clusterSelector` | empty | Label selector for the Clusters to watch, e.g. `environment=gpu`. Empty selects every Cluster. Clusters it does not select are never connected to. |
 | `--restart-fallback` | `restartFallback` | `report` | What to do with a restart no remediation template can carry out: `report` it, or `replace` the Machine. |
 | `--decisions` | `decisions` | empty | Entries replacing those of the [decision table](#decisions), as comma-separated `ACTION=decision` pairs; in the chart, a map of action to decision. |

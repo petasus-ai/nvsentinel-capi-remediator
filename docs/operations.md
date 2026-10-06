@@ -171,6 +171,7 @@ The first and the last log line below are logged at debug level; add
 |---|---|
 | `workload cluster is not connected, waiting` | The Cluster's infrastructure is not provisioned yet, its kubeconfig Secret is missing, or its API server is unreachable. The cluster is polled again once Cluster API's cluster cache connects. |
 | `selecting the signal source failed, will retry` | Discovery against the workload API server failed, as it does during an upgrade. |
+| `watching the requests failed, they are read at every poll only` | The watch that has a request acted on at once could not be added, usually because the connection to the workload cluster was lost at that moment. Requests are still read at every poll, and the watch is tried again then. |
 | `collecting signals failed, will retry`, `reading nodes failed, will retry`, `reaching the workload cluster failed, will retry`, `reading the request failed, will retry` | A read from the workload cluster failed. No mark is removed on such a poll because its signal seems gone; a request that could not be read is tried again on the next. |
 | nothing at all for a cluster | It does not match `--cluster-selector`, or it is being deleted. |
 | nothing, or only reports, for a cluster whose NVSentinel no longer runs the janitor | The janitor's CRDs are still installed: Helm leaves them behind, and they keep the cluster in the mode they imply. Delete them and restart the operator to have node conditions acted on again: a removed resource is only noticed when the operator reconnects to the cluster. |
