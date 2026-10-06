@@ -1,5 +1,7 @@
 name: verify
 
+# Every pull request and every push to main is verified. A push to main that
+# passes also publishes its image as "dev". See docs/releasing.md.
 on:
   push:
     branches:
@@ -60,3 +62,74 @@ jobs:
         run: |
           docker buildx build --platform linux/amd64 --load -t nvsentinel-capi-remediator:ci .
           docker run --rm nvsentinel-capi-remediator:ci --help
+
+  # The dev image is main as it is now, for trying a change before it is
+  # released. It is not a release: those are the version tags the release
+  # workflow publishes, and latest follows them. Nothing is published from a
+  # tree that does not pass, and the checks above run in jobs that are given
+  # no secret.
+  dev:
+    name: publish the dev image
+    if: github.event_name == 'push'
+    needs: [verify, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # One push of the tag at a time. A run that is waiting gives way to a
+    # later one, which is the commit that is to be published anyway.
+    concurrency:
+      group: ${{ github.workflow }}-dev-image
+      cancel-in-progress: false
+    env:
+      IMAGE: quay.io/edgestack/nvsentinel-capi-remediator
+      # Whether the secrets are there, not what they are: they are only
+      # given to the step that logs in.
+      HAVE_IMAGE_ACCOUNT: ${{ secrets.QUAY_USER_NAME != '' && secrets.QUAY_PASSWORD != '' }}
+    steps:
+      - name: Check the secrets
+        run: |
+          if [ "$HAVE_IMAGE_ACCOUNT" != true ]; then
+            echo "the secrets QUAY_USER_NAME and QUAY_PASSWORD are not both set for this repository"
+            exit 1
+          fi
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The checks of two pushes can finish in either order, and the tag
+      # must end up on the newer commit: a commit that is no longer the head
+      # of main leaves the tag to the run of the one that is.
+      - name: Compare with main
+        id: head
+        run: |
+          head="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+            echo "main has moved on to ${head:-an unknown commit}; its run publishes the dev image"
+          fi
+
+      - name: Log in to quay.io
+        if: steps.head.outputs.newest == 'true'
+        env:
+          QUAY_USER_NAME: ${{ secrets.QUAY_USER_NAME }}
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: printf '%s' "$QUAY_PASSWORD" | docker login quay.io --username "$QUAY_USER_NAME" --password-stdin
+
+      # A multi-platform build needs the docker-container driver; the
+      # runner's default docker driver builds for one platform only.
+      - name: Create a multi-platform builder
+        if: steps.head.outputs.newest == 'true'
+        run: docker buildx create --use
+
+      # The revision label tells which commit a dev image was built from,
+      # since the tag itself moves with every push.
+      - name: Build and push the image
+        if: steps.head.outputs.newest == 'true'
+        run: make docker-buildx IMG="$IMAGE:dev" REVISION="$GITHUB_SHA"
+
+      - name: Log out of quay.io
+        if: always() && steps.head.outputs.newest == 'true'
+        run: docker logout quay.io

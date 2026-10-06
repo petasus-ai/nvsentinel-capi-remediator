@@ -35,6 +35,9 @@ PLATFORMS ?= linux/amd64,linux/arm64
 # builder's cache, which proves the Dockerfile for every platform without a
 # registry. Anything else pushes.
 PUSH ?= true
+# The commit docker-buildx labels the image with, as
+# org.opencontainers.image.revision. Empty leaves the label out.
+REVISION ?=
 
 # Go packages in the module, without the ones behind a build tag. Empty
 # until the first package lands, in which case test is a no-op instead of
@@ -158,6 +161,7 @@ docker-build:
 # platform by platform cannot copy.
 docker-buildx:
 	docker buildx build --platform $(PLATFORMS) --provenance=false --sbom=false -t $(IMG) \
+	  $(if $(REVISION),--label org.opencontainers.image.revision=$(REVISION)) \
 	  $(if $(filter false,$(PUSH)),--output type=cacheonly,--push) .
 
 # Renders config/default with the image $(1) in place of the default. The

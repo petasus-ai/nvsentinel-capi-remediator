@@ -45,3 +45,24 @@ The first push creates the image repository, which quay.io may well create
 private. Before the chart goes out, the workflow checks that the image can be
 pulled without credentials, and stops if it cannot: make the repository
 public and run the workflow again. Expect that on the first release.
+
+## The dev image
+
+Every push to `main` that passes the `verify` workflow publishes the image
+built from it as `quay.io/edgestack/nvsentinel-capi-remediator:dev`, for the
+same platforms. It is `main` as it is now, for trying a change before it is
+released, and nothing else is published with it: no chart, no installer and
+no GitHub release. A release never moves `dev`, and a push to `main` never
+moves `latest` or a version tag.
+
+The tag moves with every push, so run it with the pull policy `Always`,
+and read the commit it was built from off its
+`org.opencontainers.image.revision` label:
+
+```
+helm upgrade nvsentinel-capi-remediator ... --reuse-values \
+  --set image.tag=dev --set image.pullPolicy=Always
+```
+
+It uses the same two image secrets as a release, given only to the step
+that logs in.
