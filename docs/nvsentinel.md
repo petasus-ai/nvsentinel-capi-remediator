@@ -19,7 +19,7 @@ With the remediation pipeline, NVSentinel cordons and drains a faulty node
 and then creates the maintenance resource configured for the recommended
 action. Pointing the actions this operator handles at
 `ExternalRemediationRequest` is what hands them over. The part of the values
-of NVSentinel's Helm chart (v1.23.0) that does so follows; NVSentinel's own
+of NVSentinel's Helm chart (v1.26.0) that does so follows; NVSentinel's own
 prerequisites, such as cert-manager, apply as they do without it.
 
 ```yaml
@@ -91,10 +91,12 @@ Notes on that configuration:
   janitor's own `RebootNode` and `REPLACE_VM` to `TerminateNode`, which need
   the janitor's cloud provider. Set an action to `null`, as the example does
   for `COMPONENT_RESET`, to have nothing done about it: the node then stays
-  cordoned until its fault clears.
+  cordoned until its fault clears. [A GPU reset](#a-gpu-reset) has the
+  alternatives for that action.
 - **The janitor expects its cloud provider.** Where the provider is not
-  deployed, turn off the janitor's `rebootNode`, `terminateNode` and
-  `gpuReset` controllers (`janitor.config.controllers.<name>.enabled: false`)
+  deployed, turn off the janitor's `rebootNode` and `terminateNode`
+  controllers, and `gpuReset` unless you use it, which needs no provider
+  (`janitor.config.controllers.<name>.enabled: false`),
   and the provider's TLS and authentication
   (`janitor.config.cspProvider.tls.enabled` and `.auth.enabled`), or the
   janitor pod waits for a certificate nobody issues. The controller that
@@ -103,6 +105,124 @@ Notes on that configuration:
   whether or not they were answered. Deleting a request hands its node back
   to NVSentinel, so that is also how long a node nobody remediates stays
   released.
+- **A fault that outlasts its remediation gets a new request.** Once a
+  request is answered `True` the monitors return, report what they still
+  see, and fault-remediation opens another request for an event newer than
+  the answered one, without limit by default. Set
+  `fault-remediation.maxRemediationAttempts` to end that: after that many
+  attempts within one quarantine NVSentinel labels the node
+  `remediation-failed` and leaves it cordoned, not released. A request the
+  operator declined counts as an attempt, and so does one that could not be
+  created. The actions that share an equivalence group share the count, so
+  1 would also refuse a replacement asked for after a restart.
+
+## A GPU reset
+
+`COMPONENT_RESET` is NVSentinel's recommendation to reset one GPU. This
+operator does not reset GPUs, which leaves three things to do with it.
+
+**Have NVSentinel's janitor reset the GPU.** The janitor's `GPUReset` takes
+the GPU operator's services off the node, runs `nvidia-smi --gpu-reset` for
+that GPU in a Job on the node, and puts the services back. It needs no cloud
+provider, and it has been seen to work on a GPU passed through to a KubeVirt
+virtual machine. The operator has no part in it, except when a reset fails:
+NVSentinel then reports a fault that asks for a restart, which goes to a
+request like any other. On chart v1.26.0, merged into the values above,
+where it takes the place of the `null` under the same `actions` key:
+
+```yaml
+fault-remediation:
+  maintenance:
+    actions:
+      COMPONENT_RESET:
+        apiGroup: janitor.dgxc.nvidia.com
+        version: v1alpha1
+        kind: GPUReset
+        scope: Cluster
+        completeConditionType: Complete
+        templateFileName: gpureset.yaml
+        equivalenceGroup: gpu-reset
+        impactedEntityScope: GPU_UUID
+        # Held back while a request for the node is open. The group has to
+        # be one another action defines.
+        supersedingEquivalenceGroups: [external-remediation]
+    templates:
+      gpureset.yaml: |
+        apiVersion: janitor.dgxc.nvidia.com/v1alpha1
+        kind: GPUReset
+        metadata:
+          name: gpureset-{{ .HealthEventID }}
+        spec:
+          nodeName: {{ printf "%q" .HealthEvent.NodeName }}
+          selector:
+            uuids:
+              - {{ printf "%q" .ImpactedEntityScopeValue }}
+
+node-drainer:
+  # Drain only the pods using the GPU.
+  partialDrainEnabled: true
+
+gpu-health-monitor:
+  dcgmConnectivity:
+    runtimeDebounce:
+      failureThreshold: 4
+
+janitor:
+  config:
+    controllers:
+      gpuReset:
+        enabled: true
+```
+
+What to check before relying on it:
+
+- **Where the GPU operator runs.** The janitor's built-in description of it
+  looks in the `gpu-operator` namespace. Anywhere else, give
+  `janitor.config.controllers.gpuReset.serviceManager.spec` in full:
+  `namespace`, `managerSelector`, `teardownTimeout`, `restoreTimeout`, and
+  for each app `appSelector`, `nodeLabel`, `enabledValue` and
+  `disabledValue`. Nothing in a description given this way has a default:
+  without the two values the node's `nvidia.com/gpu.deploy.*` labels are
+  emptied for the reset and never set back, and the services stay away.
+- **Which services run.** The janitor does not call a reset done before
+  every service in the description has a ready pod on the node again. The
+  built-in description lists the device plugin, so on a cluster whose GPUs
+  the DRA driver hands out, where the GPU operator runs no device plugin, a
+  reset that worked ends `RestoreTimeoutExceeded` ten minutes later. List
+  the services that do run: DCGM, the DCGM exporter and GPU feature
+  discovery.
+- **DCGM is away during a reset.** The GPU health monitor reports the first
+  failed poll of DCGM as a fault of its own, which can quarantine the node
+  again after a reset. The debounce above makes that four polls in a row.
+- **What the reset Job needs.** It runs on the workload node, privileged and
+  with host paths, in the janitor's namespace, so that namespace's pod
+  security has to admit it. It asks for the runtime class `nvidia`, runs
+  `nvidia-smi` from the GPU operator's driver container at
+  `/run/nvidia/driver` (for a driver installed on the host see
+  `resetJob.hostDriverRootPath`), and pulls
+  `ghcr.io/nvidia/nvsentinel/gpu-reset` on every reset. Where one of these
+  does not hold, the Job ends before it reports anything, fault-remediation
+  reads the `GPUReset` as done either way, and the node stays cordoned with
+  nothing acting on it.
+- **Which pods are drained.** With `partialDrainEnabled` only the pods using
+  the GPU are, which NVSentinel knows from an annotation its metadata
+  collector keeps on them from the kubelet's pod resources; claims of the
+  `gpu.nvidia.com` DRA driver are understood. A pod with a claim that
+  carries no such annotation is left running, and the reset then fails on a
+  busy GPU; a device-plugin pod without it holds the drain up until it has
+  one.
+
+**Have nothing done.** Set the action to `null`, as the first example does.
+The node stays cordoned and drained until something clears the fault.
+
+**Have the node restarted.** Route `COMPONENT_RESET` to a request like the
+other three, in the same equivalence group, leave `partialDrainEnabled` off,
+and tell the operator to treat the action as a restart. By default it only
+reports it, which declines the request:
+
+```
+--decisions=COMPONENT_RESET=restart
+```
 
 ## What happens to a released node
 
