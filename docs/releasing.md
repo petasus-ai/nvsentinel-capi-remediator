@@ -1,9 +1,21 @@
 # Releasing
 
-A release is a version tag, normally on `main`:
+A release is a version tag on the release branch of its minor version:
+`v0.2.1` is cut from `release-0.2`. The first release of a minor version cuts
+the branch from `main`:
 
 ```
-git tag v0.1.0 && git push origin v0.1.0
+git switch -c release-0.3 main && git push origin release-0.3
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+Every later release of that branch raises the patch version. While `main` has
+nothing that waits for the next minor version, fast-forward the branch to
+`main`; after that, cherry-pick what the release needs:
+
+```
+git switch release-0.3 && git merge --ff-only main && git push origin release-0.3
+git tag v0.3.1 && git push origin v0.3.1
 ```
 
 The `release` workflow then runs `make verify` and publishes, in this order:
@@ -25,6 +37,10 @@ latest release.
 
 Rules:
 
+- **Tag the release branch.** A tag on a commit that the branch of its minor
+  version does not hold stops the workflow before anything is published; so
+  does one whose branch does not exist. A pre-release such as `v0.3.0-rc.1`
+  is cut from `release-0.3` like the release it precedes.
 - **Never move or reuse a tag.** A chart version that is already published
   with other contents stops the workflow, and an image tag that is already
   published is not rebuilt.

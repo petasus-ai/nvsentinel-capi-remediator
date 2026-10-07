@@ -1,7 +1,7 @@
 name: release
 
-# A version tag publishes the image and the chart built from it. See
-# docs/releasing.md.
+# A version tag on the release branch of its minor version publishes the image
+# and the chart built from it. See docs/releasing.md.
 on:
   push:
     tags:
@@ -81,6 +81,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # v0.2.1 is cut from the branch release-0.2, and so is v0.3.0-rc.1 from
+      # release-0.3: every release of a minor version is on one branch, which
+      # only moves by patches. A tag anywhere else publishes nothing.
+      - name: Check the release branch
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          version="${version%%-*}"
+          branch="release-${version%.*}"
+          if [ -z "$(git ls-remote --heads origin "refs/heads/$branch")" ]; then
+            echo "$GITHUB_REF_NAME is cut from the branch $branch, which does not exist"
+            exit 1
+          fi
+          git fetch --quiet origin "refs/heads/$branch"
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "$GITHUB_REF_NAME is on a commit that the branch $branch does not hold"
+            exit 1
+          fi
 
       # The job that publishes does not restore a build cache: what is in it
       # was written by other runs.
