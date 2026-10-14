@@ -25,6 +25,33 @@ being built. For running it, see [docs/configuration.md](docs/configuration.md),
 [docs/operations.md](docs/operations.md) and, for the NVSentinel side,
 [docs/nvsentinel.md](docs/nvsentinel.md).
 
+## Demo
+
+Click any recording to watch it full size.
+
+<table>
+<tr>
+<td align="center" valign="top" width="33%">
+<a href="docs/images/gpu-reset.gif">
+<img src="docs/images/gpu-reset.png" alt="GPU Reset" width="100%"/>
+<br/><b>GPU Reset</b>
+</a>
+</td>
+<td align="center" valign="top" width="33%">
+<a href="docs/images/gpu-vm-restart.gif">
+<img src="docs/images/gpu-vm-restart.png" alt="Node VM Restart" width="100%"/>
+<br/><b>Node VM Restart</b>
+</a>
+</td>
+<td align="center" valign="top" width="33%">
+<a href="docs/images/gpu-node-replace.gif">
+<img src="docs/images/gpu-node-replace.png" alt="Node Replacement" width="100%"/>
+<br/><b>Node Replacement</b>
+</a>
+</td>
+</tr>
+</table>
+
 ## Design
 
 1. **Read.** The operator runs in the management cluster and reaches every
