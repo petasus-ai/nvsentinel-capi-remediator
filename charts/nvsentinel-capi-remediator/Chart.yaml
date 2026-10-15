@@ -7,8 +7,8 @@ type: application
 # The release workflow stamps both versions from the tag it is run for.
 # Here they follow the latest release, so that a chart installed from a
 # checkout runs that release's image by default.
-version: 0.2.0
-appVersion: v0.2.0
+version: 0.2.1
+appVersion: v0.2.1
 home: https://github.com/petasus-ai/nvsentinel-capi-remediator
 sources:
   - https://github.com/petasus-ai/nvsentinel-capi-remediator
