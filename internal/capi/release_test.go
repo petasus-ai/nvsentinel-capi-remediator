@@ -210,6 +210,26 @@ func TestEscalateLeavesOtherMachinesAlone(t *testing.T) {
 	}
 }
 
+func TestEscalateAPausedOrOptedOutMachine(t *testing.T) {
+	// The pause or the opt-out keeps Cluster API from acting either way;
+	// the replacement must still be recorded, or a restart that clears the
+	// signal before the hold is lifted would cancel it.
+	for name, hold := range map[string]func(*clusterv1.Machine){"paused": paused, "opted out": optedOut} {
+		t.Run(name, func(t *testing.T) {
+			m := newMachine("w", markedBy(ActionRestart), hold)
+			a, rec := newActuator(t, m)
+
+			if escalated, err := a.Escalate(context.Background(), m, "x"); err != nil || !escalated {
+				t.Fatalf("Escalate = %v, %v; want escalated", escalated, err)
+			}
+			if action, _ := MarkedAction(stored(t, a.Client, m)); action != ActionRemediate {
+				t.Fatalf("MarkedAction = %q, want %q", action, ActionRemediate)
+			}
+			assertEvent(t, rec, "Warning MarkedForRemediation Restart escalated to a replacement: x")
+		})
+	}
+}
+
 func TestEscalateDryRunWritesNothing(t *testing.T) {
 	m := newMachine("w", markedBy(ActionRestart))
 	a, rec := newActuator(t, m)

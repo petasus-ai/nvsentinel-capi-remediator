@@ -126,6 +126,17 @@ func RestartAnswers(m *clusterv1.Machine, request string) bool {
 // signal. It reports whether the mark changed, and changes nothing in dry
 // run or on a Machine not marked by this operator for a restart. The
 // Machine is updated in place only when the patch succeeded.
+//
+// A paused Machine, and one opted out of remediation, are escalated too
+// when NVSentinel calls for a replacement; the controller does not ask for
+// it when only the restart fallback would turn a restart into one. The
+// pause or the opt-out keeps Cluster API from acting on the mark either
+// way, and the replacement goes ahead once it is lifted. Holding the
+// escalation back instead would leave the replacement to the timing of the
+// next poll: a restart already under way, or the one Cluster API starts as
+// soon as the hold is lifted, clears a signal read from the kernel log
+// whether or not the fault is gone, and the restart mark would then be
+// released with no replacement.
 func (a *Actuator) Escalate(ctx context.Context, m *clusterv1.Machine, reason string) (bool, error) {
 	if action, ok := MarkedAction(m); !ok || action != ActionRestart || !m.DeletionTimestamp.IsZero() {
 		return false, nil

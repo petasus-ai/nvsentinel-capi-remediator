@@ -488,9 +488,9 @@ func (r *ClusterReconciler) handle(
 // a Replace, and only remediation templates for a Restart, since a check
 // without a template would replace the Machine instead. A Restart that no
 // template can carry out follows the restart fallback: reported, or
-// handed over as a Replace. Otherwise the signal is reported. Guards come
-// first, so that a Machine already being remediated reads as in progress
-// rather than unavailable.
+// handed over as a Replace. Otherwise the signal is reported. The guards
+// come before those reports, so that a Machine already being remediated
+// reads as in progress rather than unavailable.
 func (r *ClusterReconciler) remediate(
 	ctx context.Context, log logr.Logger, cluster *clusterv1.Cluster, checks []clusterv1.MachineHealthCheck,
 	sig signal.Signal, outcome decision.Outcome, machine *clusterv1.Machine, node *corev1.Node, obs, previous observation,
@@ -519,7 +519,10 @@ func (r *ClusterReconciler) remediate(
 	// that finds its Machine marked. Where it calls for a restart it waits,
 	// releaseRestarts removes the mark, and a later pass asks for a restart
 	// of its own; where the restart falls back to a replacement, the mark
-	// is turned into one below.
+	// is turned into one below, unless the Machine is paused or opted out.
+	// The mark is then released like any leftover, and the request is
+	// handled as for an unmarked Machine with that hold: it waits for the
+	// Machine to be unpaused, or is declined while it is opted out.
 	if restart && sig.Request != "" && capi.RestartCompleted(machine, node) && capi.RestartAnswers(machine, sig.Request) {
 		obs.Answer = answer{Complete: true, Reason: AnswerRestarted,
 			Message: fmt.Sprintf("node %s restarted and is Ready", sig.Node)}
@@ -551,11 +554,20 @@ func (r *ClusterReconciler) remediate(
 		}
 	}
 
-	if !restart {
-		// A replacement called for after this operator asked for a restart
-		// must outlive the restart: the mark is turned into a replacement
-		// mark, which is never released. A dry run cannot change the mark,
-		// so it may later say it would release a Machine a live run keeps.
+	// A replacement called for after this operator asked for a restart
+	// must outlive the restart: the mark is turned into a replacement mark,
+	// which is never released. A dry run cannot change the mark, so it may
+	// later say it would release a Machine a live run keeps. It comes before
+	// the guards, which skip every marked Machine, so a paused or opted-out
+	// Machine is escalated too when NVSentinel calls for a replacement (see
+	// Escalate). A restart the fallback turns into a replacement is not
+	// escalated on such a Machine: nothing new restarts it while the hold
+	// lasts, so its signal normally stays, and the fallback is decided again
+	// once the hold is lifted, under the MachineHealthChecks that will then
+	// act. Should the signal clear anyway, the restart is no longer called
+	// for, and the mark is released like any restart mark.
+	held := capi.IsPaused(machine) || capi.IsOptedOut(machine)
+	if !restart && (outcome.Decision == decision.Replace || !held) {
 		escalated, err := r.actuator().Escalate(ctx, machine,
 			fmt.Sprintf("%s %s: %s", sig.Origin, describe(sig), outcome.Reason))
 		switch {

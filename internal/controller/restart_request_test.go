@@ -183,6 +183,45 @@ func TestReconcileDoesNotAnswerARequestWithAnotherRequestsRestart(t *testing.T) 
 	}
 }
 
+func TestReconcileReleasesTheLeftoverMarkOfAHeldMachineUnderTheFallback(t *testing.T) {
+	// The restart extrr-1 asked for is over and its mark was left behind;
+	// extrr-2 asks for a restart that only the replace fallback can carry
+	// out. On a held Machine the mark is not turned into a replacement
+	// mark: it is released like any leftover, and extrr-2 is handled like a
+	// request for an unmarked Machine with that hold.
+	tests := []struct {
+		hold   string
+		status string
+		reason string
+	}{
+		{clusterv1.PausedAnnotation, "Unknown", ""},
+		{clusterv1.MachineSkipRemediationAnnotation, "False", string(capi.SkipOptedOut)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.hold, func(t *testing.T) {
+			held := func(m *clusterv1.Machine) { m.Annotations[tt.hold] = "" }
+			f := newFixture(t, fixtureOptions{
+				restartFallback: RestartFallbackReplace,
+				workloadMapper:  requestMode(),
+				workloadObjs: []client.Object{
+					answered(pendingRequest("extrr-1", "gpu-w-1", "SysLogsXIDError", "RESTART_BM")),
+					pendingRequest("extrr-2", "gpu-w-1", "SysLogsXIDError", "RESTART_BM"),
+				},
+			}, []client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", restartedFor("extrr-1", "boot-1"), held)},
+				bootedNode("gpu-w-1", "boot-2"))
+
+			assertPoll(t, f.reconcile(t))
+			assertPoll(t, f.reconcile(t))
+			if capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+				t.Fatal("the leftover mark of a held Machine was kept")
+			}
+			if status, reason := f.requestAnswer(t, "extrr-2"); status != tt.status || reason != tt.reason {
+				t.Fatalf("extrr-2 answer = %q %q, want %q %q", status, reason, tt.status, tt.reason)
+			}
+		})
+	}
+}
+
 // The same, from the failed release on: the request that asked is answered,
 // the release fails, and a new request arrives before the next poll.
 func TestReconcileDoesNotAnswerANewRequestAfterAFailedRelease(t *testing.T) {

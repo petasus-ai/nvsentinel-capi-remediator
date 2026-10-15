@@ -1038,6 +1038,66 @@ func TestReconcileNeverReleasesARestartEscalatedToAReplacement(t *testing.T) {
 	assertEvents(t, f.events())
 }
 
+func TestReconcileEscalatesThePausedOrOptedOutMachinesRestartMark(t *testing.T) {
+	for _, hold := range []string{clusterv1.PausedAnnotation, clusterv1.MachineSkipRemediationAnnotation} {
+		t.Run(hold, func(t *testing.T) {
+			held := func(m *clusterv1.Machine) { m.Annotations[hold] = "" }
+			node := newNode("gpu-w-1", raised("GpuXidError", replaceMessage))
+			f := newFixture(t, fixtureOptions{healthChecks: []*clusterv1.MachineHealthCheck{newHealthCheck("reboot", withTemplate)}},
+				[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart), held)}, node)
+
+			// The hold keeps Cluster API from acting, not the replacement
+			// from being recorded.
+			assertPoll(t, f.reconcile(t))
+			if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRemediate {
+				t.Fatalf("MarkedAction = %q, want the restart escalated to %q", action, capi.ActionRemediate)
+			}
+			assertEvents(t, f.events(), "Warning MarkedForRemediation Restart escalated to a replacement")
+
+			// A restart that clears the signal while the hold is on does
+			// not take the replacement back.
+			lower(t, f, node)
+			assertPoll(t, f.reconcile(t))
+			if !capi.IsMarkedForRemediation(f.machine(t, "gpu-w-1")) {
+				t.Fatal("escalated Machine was released")
+			}
+			assertEvents(t, f.events())
+		})
+	}
+}
+
+func TestReconcileDecidesTheRestartFallbackOfAHeldMachineOnceItIsLifted(t *testing.T) {
+	for _, hold := range []string{clusterv1.PausedAnnotation, clusterv1.MachineSkipRemediationAnnotation} {
+		t.Run(hold, func(t *testing.T) {
+			// The Machine carries a restart mark, and a check without a
+			// template now selects it, so a restart falls back to a
+			// replacement. While it is held nothing can restart it, so the
+			// signal stays and the fallback waits for the hold to be lifted.
+			held := func(m *clusterv1.Machine) { m.Annotations[hold] = "" }
+			f := newFixture(t, fixtureOptions{restartFallback: RestartFallbackReplace},
+				[]client.Object{newCluster(), newMachine("gpu-w-1", "gpu-w-1", markedFor(capi.ActionRestart), held)},
+				newNode("gpu-w-1", raised("GpuXidError", restartMessage)))
+
+			assertPoll(t, f.reconcile(t))
+			if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRestart {
+				t.Fatalf("MarkedAction = %q, want the restart mark kept while the Machine is held", action)
+			}
+			assertEvents(t, f.events())
+
+			m := f.machine(t, "gpu-w-1")
+			delete(m.Annotations, hold)
+			if err := f.hub.Update(context.Background(), m); err != nil {
+				t.Fatalf("update machine: %v", err)
+			}
+			assertPoll(t, f.reconcile(t))
+			if action, _ := capi.MarkedAction(f.machine(t, "gpu-w-1")); action != capi.ActionRemediate {
+				t.Fatalf("MarkedAction = %q, want the fallback applied once the hold is lifted", action)
+			}
+			assertEvents(t, f.events(), "Warning MarkedForRemediation Restart escalated to a replacement")
+		})
+	}
+}
+
 func TestReconcileRetriesAFailedEscalation(t *testing.T) {
 	failing := true
 	f := newFixture(t, fixtureOptions{hubFuncs: interceptor.Funcs{
