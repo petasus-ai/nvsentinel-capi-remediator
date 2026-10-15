@@ -1,0 +1,62 @@
+name: Bug report
+description: The operator did something it should not have, or did not do what it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If NVSentinel reported a fault and the operator reached the wrong decision for it, use the fault mapping report instead. Report a security problem as SECURITY.md describes, not in an issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What the operator did, and what you expected it to do.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The steps, or the signal and the state of the Machine that led to it.
+  - type: input
+    id: version
+    attributes:
+      label: Operator version
+      placeholder: v0.2.0, or the commit of a dev image
+    validations:
+      required: true
+  - type: input
+    id: cluster-api
+    attributes:
+      label: Cluster API version
+  - type: input
+    id: providers
+    attributes:
+      label: Infrastructure and control plane providers
+      description: With their versions, and the remediation template the MachineHealthChecks use, if any.
+  - type: input
+    id: nvsentinel
+    attributes:
+      label: NVSentinel version
+  - type: dropdown
+    id: source
+    attributes:
+      label: Signal source
+      description: The operator records the source it chose as an Event on the Cluster.
+      options:
+        - ExternalRemediationRequest
+        - Node condition
+        - Not sure
+  - type: dropdown
+    id: dry-run
+    attributes:
+      label: Dry run
+      options:
+        - "Yes"
+        - "No"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and Events
+      description: The operator's log around the time it happened, and the Events on the Machine and the Cluster.
+      render: text

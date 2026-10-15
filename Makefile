@@ -38,13 +38,15 @@ PUSH ?= true
 # The commit docker-buildx labels the image with, as
 # org.opencontainers.image.revision. Empty leaves the label out.
 REVISION ?=
+# The commit verify-dco checks from: every commit after it must be signed off.
+DCO_BASE ?= origin/main
 
 # Go packages in the module, without the ones behind a build tag. Empty
 # until the first package lands, in which case test is a no-op instead of
 # failing on "no packages".
 PKGS = $(shell $(GO) list ./... 2>/dev/null)
 
-.PHONY: all build fmt vet test test-integration manifests verify verify-fmt verify-mod verify-boilerplate verify-manifests verify-kustomize verify-chart
+.PHONY: all build fmt vet test test-integration manifests verify verify-fmt verify-mod verify-boilerplate verify-dco verify-manifests verify-kustomize verify-chart
 .PHONY: docker-build docker-buildx build-installer chart-package deploy undeploy
 
 all: verify build
@@ -79,6 +81,11 @@ verify-mod:
 
 verify-boilerplate:
 	hack/verify-boilerplate.sh
+
+# Not part of verify: it checks a branch against DCO_BASE, which only makes
+# sense before the branch is merged. Pull requests run it in the dco workflow.
+verify-dco:
+	hack/verify-dco.sh $(DCO_BASE) HEAD
 
 manifests:
 	$(CONTROLLER_GEN) $(RBAC_ARGS) output:rbac:artifacts:config=config/rbac

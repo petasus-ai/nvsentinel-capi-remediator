@@ -1,0 +1,43 @@
+name: Fault mapping report
+description: NVSentinel reported a fault and the operator reached the wrong decision for it.
+labels: ["fault mapping"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The decision table is covered by tests built from real NVSentinel messages, and the one you paste can become one of them. Remove what you cannot share, such as node names, but keep the layout of the message as it is.
+  - type: textarea
+    id: signal
+    attributes:
+      label: Signal
+      description: |
+        For a node condition, its type, reason and verbatim message. For an ExternalRemediationRequest, its spec (`kubectl get externalremediationrequest <name> -o yaml`).
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: decision
+    attributes:
+      label: Decision the operator reached
+      description: As its log or the Event on the Machine shows it.
+      placeholder: Report, Restart or Replace
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Decision you expected, and why
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: NVSentinel and operator versions
+    validations:
+      required: true
+  - type: textarea
+    id: decisions
+    attributes:
+      label: Decision table overrides
+      description: The `--decisions` value, or the chart's `decisions`, if you set one.
+      render: yaml

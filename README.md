@@ -182,11 +182,19 @@ replaced; integration tests that run the manager against real API servers;
 a release workflow that publishes the image and the chart for every version
 tag.
 
+Next, and open for anyone to pick up: running Cluster API's own
+MachineHealthCheck reconciler in the integration tests
+([#12](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/12)), fewer live reads when many requests are
+pending in one cluster ([#11](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/11)), and confirming
+the restart path and the control plane guard with more providers
+([#13](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/13)).
+
 ## Development
 
 ```
 make verify                        # gofmt, go.mod, license headers, manifests, vet, unit and integration tests
 make test-integration              # the manager against two real API servers, downloaded on first use
+make verify-dco                    # every commit after DCO_BASE (origin/main) signed off by its author
 make docker-build                  # image for the local Docker daemon, tagged IMG
 make docker-buildx IMG=<image>     # linux/amd64 and linux/arm64 image, pushed to IMG
 make deploy IMG=<image>            # render config/default with that image and apply it to the current kubectl context
@@ -230,6 +238,10 @@ release is cut.
 
 Contributions are welcome. Every commit must carry a Developer Certificate of
 Origin sign-off (`git commit -s`); see [CONTRIBUTING.md](CONTRIBUTING.md).
+Open work is tracked in issues labelled
+[help wanted](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22help%20wanted%22).
+Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md), and
+security problems are reported as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 

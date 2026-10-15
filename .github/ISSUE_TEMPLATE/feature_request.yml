@@ -1,0 +1,28 @@
+name: Feature or environment request
+description: Something the operator should do, or an environment it should work in.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: The situation the operator does not handle today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: The infrastructure and control plane providers, Cluster API and NVSentinel versions, if the request is about them.
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you work on it?
+      options:
+        - "Yes"
+        - With some help
+        - "No"
