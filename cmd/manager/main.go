@@ -70,7 +70,7 @@ func main() {
 	flag.BoolVar(&leaderElect, "leader-elect", false,
 		"Enable leader election so that only one replica acts at a time.")
 	flag.BoolVar(&dryRun, "dry-run", true,
-		"Log every decision but touch no Machine and record no Event.")
+		"Log every decision and write nothing: mark or unmark no Machine, answer no request, record no Event.")
 	flag.DurationVar(&pollInterval, "poll-interval", controller.DefaultPollInterval,
 		"How often each workload cluster's signals are read. Requests are read as soon as their node is released.")
 	flag.StringVar(&clusterSelector, "cluster-selector", "",

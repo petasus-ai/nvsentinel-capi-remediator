@@ -12,15 +12,17 @@ done about it.
 
 ## Supported versions
 
-Fixes are released as a patch of the newest minor version, from its release
-branch (see [docs/releasing.md](docs/releasing.md)). Older minor versions are
-not patched.
+Security fixes are released as a patch of the newest minor version, from
+its release branch (see [docs/releasing.md](docs/releasing.md)). Older minor
+versions are not promised a fix.
 
 ## Scope
 
-The operator runs in the management cluster. It reads the kubeconfig Secrets
-Cluster API keeps for the workload clusters, which grant whatever access
-those kubeconfigs carry, and it annotates Machines, which can make Cluster
-API restart or replace them. A way to make the operator mark a Machine it
-should not, or to use its access for anything else, is in scope. Problems in
-NVSentinel or Cluster API themselves belong to those projects.
+The operator runs in the management cluster. Its role may read every Secret
+in every namespace, which it uses to read the kubeconfig Secrets Cluster API
+keeps for the workload clusters; those grant whatever access the
+kubeconfigs carry, an administrator's by default. It also annotates
+Machines, which can make Cluster API restart or replace them. A way to make
+the operator mark a Machine it should not, or to use its access for anything
+else, is in scope. Problems in NVSentinel or Cluster API themselves belong to
+those projects.

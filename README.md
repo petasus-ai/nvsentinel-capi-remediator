@@ -1,247 +1,177 @@
 # nvsentinel-capi-remediator
 
-Bridges [NVSentinel](https://github.com/NVIDIA/NVSentinel) health signals to
-[Cluster API](https://cluster-api.sigs.k8s.io/) machine remediation.
+[![verify](https://github.com/petasus-ai/nvsentinel-capi-remediator/actions/workflows/verify.yml/badge.svg)](https://github.com/petasus-ai/nvsentinel-capi-remediator/actions/workflows/verify.yml)
+[![release](https://img.shields.io/github/v/release/petasus-ai/nvsentinel-capi-remediator)](https://github.com/petasus-ai/nvsentinel-capi-remediator/releases/latest)
+[![license](https://img.shields.io/github/license/petasus-ai/nvsentinel-capi-remediator)](LICENSE)
 
-NVSentinel detects GPU and fabric faults inside a workload cluster and knows the
-recommended action for each of them. The Cluster API `Machine` that could act on
-a fault lives in the management cluster. Nothing upstream connects the two: this
-operator reads NVSentinel's signals from each workload cluster, decides what the
-management cluster should do, and hands that decision to Cluster API through
-contracts every infrastructure provider already implements.
+Turns [NVSentinel](https://github.com/NVIDIA/NVSentinel) GPU fault signals
+into [Cluster API](https://cluster-api.sigs.k8s.io/) Machine remediation.
 
-## Status
+NVSentinel detects GPU and fabric faults inside a workload cluster and
+recommends an action for each one, such as restarting or replacing the node.
+The Cluster API `Machine` that can carry out a restart or a replacement lives
+in the management cluster, where NVSentinel does not look. This operator
+connects the two. It runs in the management cluster, reads NVSentinel's
+signals from every workload cluster, and asks Cluster API to restart or
+replace the Machine behind a faulty node. It uses only contracts that
+Cluster API defines for every infrastructure provider.
 
-The manager runs in a management cluster and, in its default dry-run mode,
-logs the decision it would take for every NVSentinel signal found in the
-workload clusters: `ExternalRemediationRequest` objects where the cluster
-serves them, node conditions otherwise. With `--dry-run=false` it asks
-Cluster API to remediate the Machines whose signal maps to a replacement or,
-where the cluster's MachineHealthChecks remediate through a template, to a
-restart, and records what it did as Events on them. A Machine marked for a
-restart is released again once the restart is over, and a request is
-answered with the outcome. The design below describes the whole of what is
-being built. For running it, see [docs/configuration.md](docs/configuration.md),
-[docs/operations.md](docs/operations.md) and, for the NVSentinel side,
-[docs/nvsentinel.md](docs/nvsentinel.md).
+It is meant for platforms that run GPU workload clusters with Cluster API and
+NVSentinel, and want a GPU fault to end in a restarted or replaced node
+without someone acting on each one.
 
 ## Demo
 
-Click any recording to watch it full size.
+Click a recording to watch it.
 
 <table>
 <tr>
 <td align="center" valign="top" width="33%">
 <a href="docs/images/gpu-reset.gif">
-<img src="docs/images/gpu-reset.png" alt="GPU Reset" width="100%"/>
-<br/><b>GPU Reset</b>
+<img src="docs/images/gpu-reset.png" alt="GPU reset" width="100%"/>
+<br/><b>GPU reset</b>
 </a>
+<br/>NVSentinel resets the GPU in place. The operator is not involved.
 </td>
 <td align="center" valign="top" width="33%">
 <a href="docs/images/gpu-vm-restart.gif">
-<img src="docs/images/gpu-vm-restart.png" alt="Node VM Restart" width="100%"/>
-<br/><b>Node VM Restart</b>
+<img src="docs/images/gpu-vm-restart.png" alt="Node restart" width="100%"/>
+<br/><b>Node restart</b>
 </a>
+<br/>The operator marks the Machine, and the provider's remediation restarts the node.
 </td>
 <td align="center" valign="top" width="33%">
 <a href="docs/images/gpu-node-replace.gif">
-<img src="docs/images/gpu-node-replace.png" alt="Node Replacement" width="100%"/>
-<br/><b>Node Replacement</b>
+<img src="docs/images/gpu-node-replace.png" alt="Node replacement" width="100%"/>
+<br/><b>Node replacement</b>
 </a>
+<br/>The operator marks the Machine for a replacement. The provider's remediation tries a restart first, then Cluster API replaces the Machine.
 </td>
 </tr>
 </table>
 
-## Design
+## How it works
 
-1. **Read.** The operator runs in the management cluster and reaches every
-   workload cluster through the kubeconfig Cluster API maintains for it. In
-   each cluster it reads NVSentinel's signals from one of two sources, chosen
-   on every poll by what the cluster serves:
-   - `ExternalRemediationRequest` objects, NVSentinel's protocol for handing a
-     node to an external remediation system. They carry the full health event,
-     mark the node as released by NVSentinel, and take a completion status back.
-     The resource ships with NVSentinel's janitor, which remediates by itself
-     every recommended action not routed to a request, so where it is served
-     the requests are the only source and node conditions are left alone.
-   - Node conditions published by NVSentinel's Kubernetes platform connector,
-     whose message carries `ErrorCode:…`, `GPU_UUID:…` and
-     `Recommended Action=…`. Used when a cluster runs NVSentinel in
-     detection-only mode. Messages that hit the connector's length limit are
-     flagged, since those have lost trailing events.
+1. **Read.** The operator reaches each workload cluster through the
+   kubeconfig Cluster API keeps for it, and reads NVSentinel's signals:
+   `ExternalRemediationRequest` objects where the cluster serves that
+   resource, node conditions where NVSentinel only detects faults.
+2. **Decide.** It maps NVSentinel's recommended action to a decision:
+   Replace, Restart or Report.
+3. **Act.** For a Replace or a Restart it marks the node's Machine with
+   Cluster API's `cluster.x-k8s.io/remediate-machine` annotation. The
+   MachineHealthChecks that select the Machine then carry out the
+   remediation.
+4. **Follow up.** Once a restart is over, the operator answers the
+   `ExternalRemediationRequest` it came from, if any, and removes its mark.
 
-   A cluster with the janitor but without `ExternalRemediationRequest`, as
-   before NVSentinel v1.10, is observed but not acted on, so that two systems
-   never remediate the same node. With NVSentinel v1.10 to v1.12 the resource
-   is served but the janitor never releases a node to a request, so nothing
-   there is reported either. The source chosen for a cluster is recorded
-   as an Event on the Cluster when it is first chosen after the operator
-   starts and whenever it changes, except in dry run. A resource installed
-   later is noticed on the next poll; a CRD that is removed is only noticed
-   once the operator reconnects to the cluster, and the CRDs Helm leaves
-   behind when NVSentinel's janitor is disabled keep the cluster in the mode
-   they imply.
-2. **Decode.** The recommended actions, error codes and GPU UUIDs are recovered
-   from the signal.
-3. **Decide.** The actions are reduced to one platform decision. When a message
-   carries several actions the most disruptive one wins.
-4. **Act.** The node is mapped back to its `Machine` through `status.nodeRef`
-   and the decision is expressed with Cluster API primitives only. When the
-   signal came from an `ExternalRemediationRequest`, the outcome is written back
-   to its `ExternalRemediationComplete` condition: `True` once a restart is
-   over, which hands the node back to NVSentinel, and `False` straight away
-   when the operator will not act, because the decision is to report, no
-   Machine owns the node, it belongs to the control plane, it opted out of
-   remediation, or no MachineHealthCheck can carry out the decision, not even
-   once the paused ones are unpaused. A replacement is not answered: the node
-   is deleted with its Machine, and Kubernetes deletes the request with it,
-   since NVSentinel makes the node its owner. A request waits while its
-   Machine is paused or already being remediated, and while the checks that
-   could act on it are paused. Requests are read again from the API server
-   before anything is done about them, so one answered a moment ago is never
-   acted on twice.
-
-| NVSentinel recommended action | Decision | Cluster API action |
+| NVSentinel recommends | Decision | What happens |
 |---|---|---|
-| `REPLACE_VM` | Replace | Set the `cluster.x-k8s.io/remediate-machine` annotation on the Machine. Every MachineHealthCheck selecting it honours the annotation regardless of its configured checks and applies its remediation: the owning MachineSet replaces the Machine, or, where the check has a remediation template, the provider's remediation runs first. |
-| `RESTART_VM`, `RESTART_BM` | Restart | The same annotation, set only when every MachineHealthCheck selecting the Machine remediates through a template (`spec.remediation.templateRef`). The check creates the request from its template and the infrastructure provider's remediation controller performs the restart. |
-| `CONTACT_SUPPORT`, `COMPONENT_RESET`, `RUN_FIELDDIAG`, `NONE`, … | Report | Log and emit an Event. By default these never delete a node: DCGM reports a false IMEX failure on topologies without a multi-node NVLink domain (NVIDIA/NVSentinel#1471), and honouring the recommended action is what keeps that from costing a node. |
+| `REPLACE_VM` | Replace | The MachineHealthChecks remediate the Machine, which ends in a replacement. |
+| `RESTART_VM`, `RESTART_BM` | Restart | The infrastructure provider's remediation restarts the Machine. This needs MachineHealthChecks with a remediation template. |
+| anything else | Report | Nothing is changed. The operator logs the signal and records an Event. |
 
-NVSentinel's `_VM` and `_BM` suffixes are lifecycle verbs rather than a
-statement about what backs the node (NVIDIA/NVSentinel#1661), so the table
-applies unchanged whatever the infrastructure provider is.
+The table can be changed; see [Decisions](docs/configuration.md#decisions).
+[docs/design.md](docs/design.md) describes each step in detail.
 
-The table above is the default. `--decisions` replaces entries and maps
-custom actions by name; see
-[docs/configuration.md](docs/configuration.md#decisions).
+## Requirements
 
-## Provider neutrality
+- A management cluster whose Cluster API serves `cluster.x-k8s.io/v1beta2`
+  (v1.11 or later).
+- NVSentinel in the GPU workload clusters. Its default install, which only
+  detects faults, is enough to start with; [docs/nvsentinel.md](docs/nvsentinel.md)
+  describes the other ways to deploy it.
+- MachineHealthChecks that select the GPU worker Machines. Without one, the
+  operator only reports. Restarts also need a remediation template from the
+  infrastructure provider; see [docs/machinehealthchecks.md](docs/machinehealthchecks.md).
+- Network access from the management cluster to each workload cluster's API
+  server, the same access Cluster API itself uses.
+- Permission to read Secrets in every namespace of the management cluster,
+  for the kubeconfig Secret of each workload cluster; see
+  [Permissions](docs/configuration.md#permissions).
 
-The operator imports Cluster API core only. Both actions above are contracts
-that every infrastructure provider already speaks:
+## Quick start
 
-- The `remediate-machine` annotation is consumed by Cluster API's own
-  MachineHealthCheck and MachineSet controllers.
-- A restart is the external remediation template contract that
-  MachineHealthCheck uses for `templateRef`. The operator never creates the
-  request itself: a MachineHealthCheck deletes the request named after every
-  Machine it finds healthy, and NVSentinel's signals are not among its checks.
-  Marking the Machine leaves the request, its lifecycle and the check's
-  unhealthy-count limits with Cluster API. Cluster API never removes the
-  annotation, so the operator removes the ones it set for a restart once
-  the restart is over. For a node condition that is when NVSentinel lowers
-  it, which it does after a reboot or once its check passes again. A node
-  released to an `ExternalRemediationRequest` is no longer watched by
-  NVSentinel, so there a new boot ID on a Ready node ends the restart: the
-  operator records the node's boot ID with every restart mark, answers the
-  request once the node reports another, and then removes the mark. Until
-  then the Machine stays unhealthy and a provider that gives up on
-  restarting it has it replaced. A replacement called for while the restart
-  is pending turns the mark into a replacement mark, which is never removed.
+Install the latest release in dry-run mode, the default, in which the
+operator logs what it would do and changes nothing. The selector limits it to
+the Clusters you label. If NVSentinel in that cluster already hands nodes
+over through `ExternalRemediationRequest`, read
+[Before you route actions to requests](docs/getting-started.md#before-you-route-actions-to-requests)
+first.
 
-A Machine that no MachineHealthCheck selects, or only paused ones, is not
-marked, since the annotation would do nothing, or act at some arbitrary time
-after an unpause; the signal is reported with an Event instead. A restart
-that no template can carry out, because no active check selects the Machine
-or one without a template does, follows the restart fallback:
+```sh
+helm install nvsentinel-capi-remediator nvsentinel-capi-remediator \
+  --repo https://raw.githubusercontent.com/petasus-ai/edgestack-helm/master/ \
+  --namespace nvsentinel-capi-remediator-system --create-namespace \
+  --set clusterSelector=nvsentinel-remediation=enabled
 
-- `report` (the default) reports it the same way, since marking the Machine
-  would replace it.
-- `replace` marks it for a replacement instead, for operators who prefer an
-  automatic recovery over a cheaper repair their provider cannot offer. That
-  mark is never removed, and an earlier restart mark on the Machine becomes a
-  replacement mark. It still needs a MachineHealthCheck to act on it.
+kubectl -n <cluster-namespace> label clusters.cluster.x-k8s.io <cluster> nvsentinel-remediation=enabled
+kubectl -n nvsentinel-capi-remediator-system logs deploy/nvsentinel-capi-remediator -f
+```
 
-The fallback is set with `--restart-fallback` and overridden per cluster with
-the `nvsentinel.petasus.io/restart-fallback` annotation on the Cluster (under
-the operator's annotation prefix), which takes effect on the next poll. An
-invalid annotation is ignored, and the Events of the signals it affects say
-so.
+Each labeled cluster logs `signal source selected` once it is read, and each
+fault NVSentinel reports there logs the decision the operator would take.
+[docs/getting-started.md](docs/getting-started.md) explains what to look for,
+how to try it with a test signal, and how to turn remediation on.
+
+Without Helm, apply the release's manifests. They install the operator in
+dry-run mode into `nvsentinel-capi-remediator-system`, without a cluster
+selector:
+
+```sh
+kubectl apply -f https://github.com/petasus-ai/nvsentinel-capi-remediator/releases/latest/download/install.yaml
+```
 
 ## Safeguards
 
-- Dry-run is the default. Decisions are logged and nothing is written until
-  remediation is enabled explicitly.
-- Control plane Machines are never remediated automatically.
-- A Machine that is already marked for remediation, already being deleted,
-  paused, or opted out with `cluster.x-k8s.io/skip-remediation` is left alone.
+- Dry-run mode is the default: the operator writes nothing until you turn it
+  off. NVSentinel still acts: where it hands nodes over through
+  `ExternalRemediationRequest`, it has cordoned and drained a node before the
+  operator sees it, and in dry-run mode nobody answers; see
+  [getting started](docs/getting-started.md#before-you-route-actions-to-requests).
+- Control plane Machines are never remediated.
+- A Machine that is being deleted, already marked, paused, or opted out with
+  `cluster.x-k8s.io/skip-remediation` is not marked. A restart mark set on it
+  earlier can still become a replacement mark; see
+  [Escalation](docs/design.md#escalation).
 - Every action leaves a Kubernetes Event on the Machine, because the Machine
-  and its annotations disappear once remediation succeeds.
+  and its annotations are gone once it is replaced.
 
-## Roadmap
+## Documentation
 
-Done: signal decoder and decision table with tests built from real
-NVSentinel messages; the controller with workload cluster polling, Machine
-mapping and the replacement path, dry-run by default; the container image,
-kustomize deployment and Helm chart; restarts through the
-MachineHealthChecks' remediation templates, released again once the restart
-is over, with a configurable fallback for restarts no template can carry
-out; the `ExternalRemediationRequest` source, chosen per cluster, with the
-outcome reported back to NVSentinel; a decision table whose entries can be
-replaced; integration tests that run the manager against real API servers;
-a release workflow that publishes the image and the chart for every version
-tag.
+| Page | Covers |
+|---|---|
+| [Getting started](docs/getting-started.md) | Checking the requirements, installing in dry-run mode, a test signal, turning remediation on |
+| [MachineHealthChecks](docs/machinehealthchecks.md) | What the MachineHealthChecks need for replacements and for restarts |
+| [NVSentinel](docs/nvsentinel.md) | Ways to deploy NVSentinel, routing actions to requests, GPU resets |
+| [Configuration](docs/configuration.md) | Settings, chart values, annotations, the decision table, permissions |
+| [Operations](docs/operations.md) | Events, answers to requests, undoing a mark, upgrading, uninstalling, troubleshooting |
+| [Design](docs/design.md) | How each step works, and why |
+| [Releasing](docs/releasing.md) | For maintainers: cutting a release |
 
-Next, and open for anyone to pick up: running Cluster API's own
-MachineHealthCheck reconciler in the integration tests
-([#12](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/12)), fewer live reads when many requests are
-pending in one cluster ([#11](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/11)), and confirming
-the restart path and the control plane guard with more providers
-([#13](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/13)).
+## Status
 
-## Development
+The operator is young. It has run end to end on one infrastructure provider,
+with Cluster API v1.13 and NVSentinel v1.23 and v1.26. Flags and chart values
+may still change between minor versions.
 
-```
-make verify                        # gofmt, go.mod, license headers, manifests, vet, unit and integration tests
-make test-integration              # the manager against two real API servers, downloaded on first use
-make verify-dco                    # every commit after DCO_BASE (origin/main) signed off by its author
-make docker-build                  # image for the local Docker daemon, tagged IMG
-make docker-buildx IMG=<image>     # linux/amd64 and linux/arm64 image, pushed to IMG
-make deploy IMG=<image>            # render config/default with that image and apply it to the current kubectl context
-make build-installer IMG=<image>   # the same rendering, written to dist/install.yaml
-make chart-package VERSION=<tag>   # the chart for that release, written to dist/
-make undeploy
-```
+Open work, labeled
+[help wanted](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22help%20wanted%22):
 
-A release publishes its image as
-`quay.io/edgestack/nvsentinel-capi-remediator:<tag>` and attaches an
-`install.yaml` rendered with it to the GitHub release; for anything else
-`IMG` has to name an image you pushed with `make docker-buildx`. The manager
-is deployed to the `nvsentinel-capi-remediator-system` namespace with
-`--dry-run=true`. Once its log shows the decisions you expect, change the
-argument to `--dry-run=false` to let it act. `make deploy` re-applies the
-checked-in manifests, so make that change in a kustomize overlay of
-`config/default` if it has to survive a redeploy.
-
-The same manager can be installed with the Helm chart in
-`charts/nvsentinel-capi-remediator`, into a namespace of your choice:
-
-```
-helm install nvsentinel-capi-remediator charts/nvsentinel-capi-remediator \
-  --namespace <namespace> --create-namespace \
-  --set image.repository=<repository> --set image.tag=<tag>
-```
-
-The manager starts in dry-run this way as well; `--set dryRun=false` lets it
-act. The other settings are described in
-[docs/configuration.md](docs/configuration.md). Install it one way or the
-other: a kustomize and a Helm install in different namespaces each hold
-their own lease, so both would act.
-
-A release publishes the chart as well, in the Helm repository at
-`https://raw.githubusercontent.com/petasus-ai/edgestack-helm/master/`, with
-the image of that release as its default. The chart version is the tag
-without its `v`. [docs/releasing.md](docs/releasing.md) describes how a
-release is cut.
+- [#13](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/13)
+  Verify the restart path and the control plane guard with more providers.
+- [#12](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/12)
+  Run Cluster API's MachineHealthCheck reconciler in the integration tests.
+- [#11](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/11)
+  Fewer live reads when many requests are pending in one cluster.
 
 ## Contributing
 
-Contributions are welcome. Every commit must carry a Developer Certificate of
-Origin sign-off (`git commit -s`); see [CONTRIBUTING.md](CONTRIBUTING.md).
-Open work is tracked in issues labelled
-[help wanted](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22help%20wanted%22).
-Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md), and
-security problems are reported as [SECURITY.md](SECURITY.md) describes.
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) describes how
+to build and test the operator and how changes are made; every commit needs
+a Developer Certificate of Origin sign-off (`git commit -s`). Everyone taking
+part follows the [Code of Conduct](CODE_OF_CONDUCT.md). Report security
+problems as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 

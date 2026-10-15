@@ -10,8 +10,9 @@ nameOverride: ""
 fullnameOverride: ""
 
 # Decisions are logged and nothing is written until this is false: no Machine
-# is marked and no Event recorded. Keep it on for the first run against live
-# clusters, and turn it off once the log shows the decisions you expect.
+# is marked, no request answered and no Event recorded. Keep it on for the
+# first run against live clusters, and turn it off once the log shows the
+# decisions you expect.
 dryRun: true
 
 # How often each workload cluster's signals are read. A request is read as

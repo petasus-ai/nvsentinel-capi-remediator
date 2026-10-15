@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        If NVSentinel reported a fault and the operator reached the wrong decision for it, use the fault mapping report instead. Report a security problem as SECURITY.md describes, not in an issue.
+        If NVSentinel reported a fault and the operator reached the wrong decision for it, use the [fault mapping report](https://github.com/petasus-ai/nvsentinel-capi-remediator/issues/new?template=fault_mapping.yml) instead. Report a security problem as [SECURITY.md](https://github.com/petasus-ai/nvsentinel-capi-remediator/blob/main/SECURITY.md) describes, not in an issue.
   - type: textarea
     id: what-happened
     attributes:
@@ -22,7 +22,8 @@ body:
     id: version
     attributes:
       label: Operator version
-      placeholder: v0.2.0, or the commit of a dev image
+      description: For a dev image, the commit in its org.opencontainers.image.revision label.
+      placeholder: v0.2.0
     validations:
       required: true
   - type: input
@@ -42,15 +43,16 @@ body:
     id: source
     attributes:
       label: Signal source
-      description: The operator records the source it chose as an Event on the Cluster.
+      description: The mode in the operator's "signal source selected" log line, or in the SignalSourceSelected Event on the Cluster (not recorded in dry-run mode).
       options:
         - ExternalRemediationRequest
-        - Node condition
+        - NodeCondition
+        - ReportOnly
         - Not sure
   - type: dropdown
     id: dry-run
     attributes:
-      label: Dry run
+      label: Dry-run mode
       options:
         - "Yes"
         - "No"

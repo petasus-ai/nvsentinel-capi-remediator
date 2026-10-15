@@ -7,4 +7,11 @@ Read them with
   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "nvsentinel-capi-remediator.fullname" . }}
 
 and set dryRun=false once they are what you expect.
+{{- else }}
+
+It acts on what NVSentinel reports. Every action is recorded as an Event:
+
+  kubectl get events.events.k8s.io -A --field-selector reportingController=nvsentinel-capi-remediator
 {{- end }}
+
+Documentation: https://github.com/petasus-ai/nvsentinel-capi-remediator/tree/main/docs

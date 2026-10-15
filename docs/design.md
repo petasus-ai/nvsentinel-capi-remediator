@@ -1,0 +1,191 @@
+# Design
+
+How the operator works, step by step, and why it works that way. To install
+and run it, start with [getting-started.md](getting-started.md).
+
+Terms used here:
+
+- A **request** is NVSentinel's `ExternalRemediationRequest`, the object
+  through which NVSentinel hands a node to an external system.
+- A **mark** is the `cluster.x-k8s.io/remediate-machine` annotation the
+  operator sets on a Machine, together with its own
+  `nvsentinel.petasus.io/remediation-*` annotations. A **restart mark** asks
+  for a restart; a **replacement mark** (`remediation-action: Remediate`)
+  asks for a replacement.
+- A **remediation object** is what a MachineHealthCheck creates from its
+  remediation template, for the infrastructure provider to act on.
+- NVSentinel **releases** a node when it hands it over through a request.
+  The operator's `Machine released from remediation` and `would release
+  Machine from remediation` log lines and its `RemediationReleased` Event
+  mean something else: it removed, or would remove, a restart mark.
+
+## Read
+
+The operator runs in the management cluster and reaches every workload
+cluster through the kubeconfig Secret Cluster API keeps for it. Per cluster
+it reads one of two sources, chosen on every poll from the resources the
+cluster serves:
+
+- **Requests**, where the cluster serves `ExternalRemediationRequest`. A
+  request carries the full health event, records that NVSentinel has
+  released the node, and takes a completion status back. The resource comes
+  with NVSentinel's janitor, which itself handles every action that
+  NVSentinel's fault-remediation maps to the janitor's own objects, so in
+  such a cluster the operator reads only requests and leaves node conditions
+  alone. It watches the requests, so a request is read as soon as NVSentinel
+  releases its node.
+- **Node conditions**, published by NVSentinel's platform connector, whose
+  messages carry `ErrorCode:…`, `GPU_UUID:…` and `Recommended Action=…`. They
+  are read where NVSentinel only detects faults. A message cut at the
+  connector's length limit has lost its last events, and the decision for
+  it is flagged as truncated.
+
+Two cases are read but not acted on, so that two systems never remediate the
+same node:
+
+- A cluster with the janitor but without `ExternalRemediationRequest`, as
+  before NVSentinel v1.10, is in `ReportOnly` mode: its node conditions are
+  reported.
+- With NVSentinel v1.10 to v1.12 the resource is served, but the janitor
+  never releases a node to a request, so the operator neither acts nor
+  reports anything in such a cluster.
+
+The operator logs the mode it chose for a cluster after every start and
+whenever it changes; outside dry-run mode it also records a
+`SignalSourceSelected` Event on the Cluster.
+[Signal source](configuration.md#signal-source) says how a resource that is
+added or removed later is noticed.
+
+## Decode and decide
+
+The recommended actions, error codes and GPU UUIDs are taken from the
+signal. The actions are reduced to one decision with the
+[decision table](configuration.md#decisions); when a signal carries several
+actions, the most disruptive one wins.
+
+NVSentinel's action names end in `_VM` or `_BM`, but the suffix does not say
+what backs the node
+([NVIDIA/NVSentinel#1661](https://github.com/NVIDIA/NVSentinel/issues/1661)),
+so the table applies to every infrastructure provider. The default reports
+everything a restart or a replacement is not known to fix. One reason is
+that DCGM reports a false IMEX failure on topologies without a multi-node
+NVLink domain
+([NVIDIA/NVSentinel#1471](https://github.com/NVIDIA/NVSentinel/issues/1471)).
+NVSentinel recommends neither a restart nor a replacement for it, and
+following that recommendation keeps the false alarm from costing a node.
+
+## Act
+
+The node is mapped to its Machine through the Machine's `status.nodeRef`, and
+the decision is expressed with Cluster API's own contracts:
+
+- **Replace:** the operator sets `cluster.x-k8s.io/remediate-machine`. Every
+  MachineHealthCheck that selects the Machine honors that annotation whatever
+  its own checks are, and remediates the Machine: its owner replaces it, or,
+  where the MachineHealthCheck has a remediation template, the provider's
+  remediation runs first.
+- **Restart:** the same annotation, set only when every MachineHealthCheck
+  that selects the Machine has a remediation template. The MachineHealthCheck
+  creates the remediation object, and the provider restarts the Machine.
+
+The Machine is not marked when:
+
+- it is being deleted, or already marked;
+- it is a control plane Machine, which the operator leaves to people;
+- it is paused, or opted out with `cluster.x-k8s.io/skip-remediation`, so
+  that a mark would take effect at an arbitrary time later;
+- no MachineHealthCheck that is not paused selects it, so that a mark would
+  do nothing.
+
+The signal is reported with an Event instead, except for a Machine that is
+being deleted or already marked, which is only logged. A request waits or is
+declined; see [operations.md](operations.md#how-requests-are-answered).
+
+### Why a mark and not a remediation object
+
+The operator never creates the remediation object itself. A
+MachineHealthCheck deletes the remediation object of every Machine it finds
+healthy, and NVSentinel's signals are not among the conditions it checks, so
+an object the operator created would be deleted again. Marking the Machine
+leaves the remediation object, its lifecycle and the MachineHealthCheck's
+unhealthy limits with Cluster API, and needs nothing from the provider beyond
+the contract every remediation template already implements.
+
+### How a restart ends
+
+Cluster API never removes the `remediate-machine` annotation; while it is
+there, the Machine stays unhealthy, and a provider that keeps restarting it
+eventually gives up and has it replaced. So the operator removes its restart
+mark once the restart is over:
+
+- **Node condition:** when NVSentinel clears the condition, which it does
+  after a reboot or once its check passes again.
+- **Request:** NVSentinel no longer watches a node it has released, so the
+  condition never clears. The operator records the node's boot ID with the
+  restart mark. Once the node is Ready with a different boot ID, it answers
+  the request with `True`, and then removes the mark.
+
+The mark is also removed when the signal goes away before the restart: the
+condition clears, or the request is deleted or answered elsewhere. A restart
+answers the request it was asked for and no other; a request raised for the
+node after it is back gets a restart of its own.
+
+Before marking a Machine for a restart again, the operator waits until the
+MachineHealthChecks have dropped what they kept for the previous mark, for
+about a minute at most; a mark set too early would be counted against the
+previous remediation object.
+
+### Escalation
+
+If a replacement is called for while a restart mark is on the Machine, the
+operator turns the restart mark into a replacement mark, which it never
+removes: a restart clears a signal read from the kernel log whether or not
+the fault is gone, so the replacement has to outlive it.
+
+That happens on a paused or opted-out Machine too. The pause or the opt-out
+keeps Cluster API from acting on the mark either way, and the replacement
+goes ahead once it is lifted. If the operator waited instead, a restart
+already under way, or the one Cluster API starts as soon as the hold is
+lifted, could clear the signal before the operator's next poll, and the
+replacement would be lost. To keep such a Machine, remove the mark as well;
+see [operations.md](operations.md#undoing-a-mark).
+
+A restart that the restart fallback turns into a replacement is different:
+on a paused or opted-out Machine the restart mark is not turned into a
+replacement mark. Nothing new restarts the Machine while the hold lasts, so
+its signal normally stays, and the fallback is decided again once the hold
+is lifted, under the MachineHealthChecks that will then act. Should the
+signal clear anyway, the restart is no longer called for, and the mark is
+removed like any restart mark.
+
+### The restart fallback
+
+A restart that no remediation template can carry out is reported by default,
+since marking the Machine would replace it. Platforms that prefer an
+automatic recovery to a cheaper repair their provider cannot offer can have
+it turned into a replacement instead; see
+[Restart fallback](configuration.md#restart-fallback).
+
+## Answer
+
+When the signal came from a request, the operator writes the outcome to the
+request's `ExternalRemediationComplete` condition: `True` once a restart is
+over, which hands the node back to NVSentinel, and `False` at once when it
+will not act. A replacement is not answered: the node is deleted with its
+Machine, and since NVSentinel makes the node the request's owner, Kubernetes
+deletes the request with it. The full table is in
+[operations.md](operations.md#how-requests-are-answered).
+
+The operator reads each request again from the workload cluster's API server
+before it does anything about it, so a request answered a moment ago is
+never acted on twice.
+
+## Provider neutrality
+
+The operator imports Cluster API core only, and both of its actions are
+contracts every infrastructure provider already speaks: the
+`remediate-machine` annotation is consumed by Cluster API's own
+MachineHealthCheck and MachineSet controllers, and a restart is the external
+remediation template contract behind a MachineHealthCheck's `templateRef`.
+What a provider has to offer for restarts is described in
+[machinehealthchecks.md](machinehealthchecks.md#what-a-remediation-template-has-to-do).
