@@ -5,8 +5,10 @@ description: >-
   Machine remediation on the management cluster.
 type: application
 # The release workflow stamps both versions from the tag it is run for.
-version: 0.1.0
-appVersion: v0.1.0
+# Here they follow the latest release, so that a chart installed from a
+# checkout runs that release's image by default.
+version: 0.2.0
+appVersion: v0.2.0
 home: https://github.com/petasus-ai/nvsentinel-capi-remediator
 sources:
   - https://github.com/petasus-ai/nvsentinel-capi-remediator
