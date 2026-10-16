@@ -60,10 +60,13 @@ Events are what is left to explain it. Nothing is recorded in dry-run mode.
 | `ExternalRemediationRequestAnswered` | Normal | A request was answered. Recorded on the Cluster when the node has no Machine. |
 | `MachineNotFound` | Warning | On the Cluster: a node with a signal has no Machine. |
 | `SignalSourceSelected` | Normal | On the Cluster: the signal source was chosen, or changed. |
+| `DevicesQuarantined` | Warning | A replace request quarantined the devices of the Machine's VM. The note names each device and its rule. |
+| `MachineReplaced` | Warning | A replace request deleted the Machine for its MachineSet to replace. |
+| `QuarantineRejected` | Warning | A replace request was rejected; the note gives the reason. |
 
 An Event's action field is `Remediate` or `Restart` when the Event concerns a
-replacement or a restart, and otherwise `Report`, `Answer` or
-`SelectSource`.
+replacement or a restart, `Quarantine` when it concerns a replace request, and
+otherwise `Report`, `Answer` or `SelectSource`.
 
 ```sh
 kubectl get events.events.k8s.io -A --field-selector reportingController=nvsentinel-capi-remediator
@@ -164,7 +167,11 @@ helm upgrade nvsentinel-capi-remediator nvsentinel-capi-remediator \
 For the manifests install, apply the new release's `install.yaml`. It starts
 in dry-run mode and without a cluster selector like every release's
 manifests, so set `--dry-run=false` again afterwards, and any other argument
-you changed, such as `--cluster-selector`.
+you changed, such as `--cluster-selector`. With
+[device quarantine](device-quarantine.md#turning-it-on) on, add its two
+arguments again too, and apply the new release's role the way you created
+it, so that it has the permissions the new release needs; the binding can
+stay.
 
 Marks and answers live on the objects, so an upgrade loses none. What the
 operator remembered about signals it already reported is lost with the old
@@ -182,7 +189,13 @@ and recorded once more.
    ```
 
    or, for the manifests install, `kubectl delete -f` the `install.yaml` you
-   applied.
+   applied. If you created the device quarantine role and binding next to
+   it, delete them too:
+
+   ```sh
+   kubectl delete clusterrolebinding nvsentinel-capi-remediator-device-quarantine-rolebinding
+   kubectl delete clusterrole nvsentinel-capi-remediator-device-quarantine-role
+   ```
 3. Look for the restart marks it left:
 
    ```sh
@@ -195,6 +208,17 @@ and recorded once more.
    gives up and has it replaced. Remove the ones you do not want replaced, as
    in [Undoing a mark](#undoing-a-mark). Replacement marks can stay: Cluster
    API completes them without the operator.
+4. With [device quarantine](device-quarantine.md) on, look for the rules it
+   made. They keep their devices out of scheduling after the operator is
+   gone; delete those of repaired devices:
+
+   ```sh
+   kubectl get devicetaintrules -l app.kubernetes.io/managed-by=nvsentinel-capi-remediator \
+     -L nvsentinel.petasus.io/machine-namespace,nvsentinel.petasus.io/machine
+   ```
+
+   The `nvsentinel.petasus.io/replace` and `replace-status` annotations of
+   requests not carried out stay on their Machines and do nothing.
 
 ## Troubleshooting
 

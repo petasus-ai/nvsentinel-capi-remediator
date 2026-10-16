@@ -1,0 +1,67 @@
+# Stand-ins for the CRDs of Cluster API Provider KubeVirt and KubeVirt, with
+# their real names, groups, versions and scopes but no schema: the operator
+# reads only a few of their fields, and the tests write those directly.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kubevirtmachines.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  scope: Namespaced
+  names:
+    kind: KubevirtMachine
+    listKind: KubevirtMachineList
+    plural: kubevirtmachines
+    singular: kubevirtmachine
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kubevirtclusters.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  scope: Namespaced
+  names:
+    kind: KubevirtCluster
+    listKind: KubevirtClusterList
+    plural: kubevirtclusters
+    singular: kubevirtcluster
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: virtualmachineinstances.kubevirt.io
+spec:
+  group: kubevirt.io
+  scope: Namespaced
+  names:
+    kind: VirtualMachineInstance
+    listKind: VirtualMachineInstanceList
+    plural: virtualmachineinstances
+    singular: virtualmachineinstance
+    shortNames:
+    - vmi
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        x-kubernetes-preserve-unknown-fields: true

@@ -74,6 +74,12 @@ Click a recording to watch it.
 The table can be changed; see [Decisions](docs/configuration.md#decisions).
 [docs/design.md](docs/design.md) describes each step in detail.
 
+When a fault outlives a restart and you decide to replace the Machine,
+[device quarantine](docs/device-quarantine.md), which is off by default, first
+takes the VM's DRA devices out of scheduling with `DeviceTaintRule`s, so that
+the replacement is not given the same faulty device. It works with Cluster
+API Provider KubeVirt.
+
 ## Requirements
 
 - A management cluster whose Cluster API serves `cluster.x-k8s.io/v1beta2`
@@ -145,6 +151,7 @@ kubectl apply -f https://github.com/petasus-ai/nvsentinel-capi-remediator/releas
 | [MachineHealthChecks](docs/machinehealthchecks.md) | What the MachineHealthChecks need for replacements and for restarts |
 | [NVSentinel](docs/nvsentinel.md) | Ways to deploy NVSentinel, routing actions to requests, GPU resets |
 | [Configuration](docs/configuration.md) | Settings, chart values, annotations, the decision table, permissions |
+| [Device quarantine](docs/device-quarantine.md) | Replacing a Machine without its replacement being given the same faulty device |
 | [Operations](docs/operations.md) | Events, answers to requests, undoing a mark, upgrading, uninstalling, troubleshooting |
 | [Design](docs/design.md) | How each step works, and why |
 | [Releasing](docs/releasing.md) | For maintainers: cutting a release |

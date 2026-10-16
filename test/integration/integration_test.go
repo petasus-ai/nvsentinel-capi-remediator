@@ -20,8 +20,9 @@ limitations under the License.
 // standing in for the management cluster and one for a workload cluster,
 // to cover what the fake clients of the unit tests cannot: reaching the
 // workload cluster through its kubeconfig Secret, choosing the signal
-// source from what that cluster's discovery serves, and answering requests
-// through their status subresource.
+// source from what that cluster's discovery serves, answering requests
+// through their status subresource, and quarantining devices with the
+// DeviceTaintRules a real API server validates and serves.
 package integration
 
 import (
@@ -40,6 +41,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -55,6 +57,7 @@ import (
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/capi"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/controller"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/decision"
+	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/quarantine"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/signal/extrr"
 )
 
@@ -81,6 +84,9 @@ var (
 	// workloadEnv is kept for the test that installs the request CRD
 	// while the manager is running.
 	workloadEnv *envtest.Environment
+	// workloadCfg reaches the workload API server, which serves no
+	// DeviceTaintRule.
+	workloadCfg *rest.Config
 )
 
 func TestMain(m *testing.M) {
@@ -109,7 +115,15 @@ func run(m *testing.M) int {
 		return 1
 	}
 
-	hubEnv := &envtest.Environment{CRDDirectoryPaths: []string{crds}, ErrorIfCRDPathMissing: true}
+	hubEnv := &envtest.Environment{
+		CRDDirectoryPaths:     []string{crds, filepath.Join("testdata", "kubevirt.crd.yaml")},
+		ErrorIfCRDPathMissing: true,
+	}
+	// The management API server serves DeviceTaintRules the way Kubernetes
+	// 1.36 does once they are turned on: in v1beta2 alone.
+	hubEnv.ControlPlane.GetAPIServer().Configure().
+		Append("feature-gates", "DRADeviceTaintRules=true").
+		Append("runtime-config", "resource.k8s.io/v1beta2/devicetaintrules=true")
 	hubCfg, err := hubEnv.Start()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "starting the management API server:", err)
@@ -118,7 +132,7 @@ func run(m *testing.M) int {
 	defer stop("management", hubEnv)
 
 	workloadEnv = &envtest.Environment{}
-	workloadCfg, err := workloadEnv.Start()
+	workloadCfg, err = workloadEnv.Start()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "starting the workload API server:", err)
 		return 1
@@ -181,9 +195,9 @@ func clusterAPICRDs() (string, error) {
 	return filepath.Join(strings.TrimSpace(string(out)), "core", "config", "crd", "bases"), nil
 }
 
-// startManager runs the controller the way cmd/manager wires it, acting
-// for real and polling fast, and returns the cluster cache for the caller
-// to shut down.
+// startManager runs the controllers the way cmd/manager wires them, acting
+// for real, polling fast and with device quarantine on, and returns the
+// cluster cache for the caller to shut down.
 func startManager(ctx context.Context, cfg *rest.Config, scheme *runtime.Scheme) (clustercache.ClusterCache, error) {
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
@@ -218,6 +232,17 @@ func startManager(ctx context.Context, cfg *rest.Config, scheme *runtime.Scheme)
 		PollInterval: pollInterval,
 	}
 	if err := reconciler.SetupWithManager(ctx, mgr, ctrlcontroller.Options{MaxConcurrentReconciles: 1}); err != nil {
+		return nil, err
+	}
+
+	q := &controller.MachineQuarantineReconciler{
+		Client:   mgr.GetClient(),
+		Locator:  &quarantine.KubeVirtLocator{Client: mgr.GetAPIReader(), Mapper: mgr.GetRESTMapper()},
+		Rules:    &quarantine.Rules{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Mapper: mgr.GetRESTMapper()},
+		Drivers:  sets.New(gpuDriver),
+		Recorder: mgr.GetEventRecorder(controller.ControllerName),
+	}
+	if err := q.SetupWithManager(mgr, ctrlcontroller.Options{MaxConcurrentReconciles: 1}); err != nil {
 		return nil, err
 	}
 

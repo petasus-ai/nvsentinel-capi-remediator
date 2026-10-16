@@ -1,0 +1,26 @@
+{{- /* Values reused from a release of an earlier chart have no deviceQuarantine. */}}
+{{- if and .Values.rbac.create (.Values.deviceQuarantine | default dict).enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-device-quarantine
+  labels:
+    {{- include "nvsentinel-capi-remediator.labels" . | nindent 4 }}
+{{/* Generated from the kubebuilder markers by `make manifests`. */ -}}
+{{ required "files/device-quarantine-role-rules.yaml is missing: run make manifests" (.Files.Get "files/device-quarantine-role-rules.yaml") | trimSuffix "\n" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-device-quarantine
+  labels:
+    {{- include "nvsentinel-capi-remediator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "nvsentinel-capi-remediator.fullname" . }}-device-quarantine
+subjects:
+- kind: ServiceAccount
+  name: {{ include "nvsentinel-capi-remediator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}

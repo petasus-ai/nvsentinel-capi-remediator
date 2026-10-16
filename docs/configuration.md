@@ -23,6 +23,13 @@ Cluster API release that serves it (v1.11 or later).
 The kubeconfig Cluster API generates is an administrator's, so no RBAC has to
 be set up in the workload clusters.
 
+[Device quarantine](device-quarantine.md), off by default, needs a role of its
+own on top: deleting Machines, reading the KubeVirt objects, pods and
+ResourceClaims behind them, and creating `DeviceTaintRule`s. The chart creates
+and binds it only when the feature is on; the manifests leave it to a
+kustomize component.
+See [its permissions](device-quarantine.md#permissions).
+
 ## Settings
 
 | Flag | Chart value | Default | Meaning |
@@ -32,6 +39,8 @@ be set up in the workload clusters.
 | `--cluster-selector` | `clusterSelector` | empty | Label selector for the Clusters to watch, for example `environment=gpu`. Empty selects every Cluster. Clusters it does not select are never connected to. |
 | `--restart-fallback` | `restartFallback` | `report` | What to do with a restart no remediation template can carry out: `report` it, or `replace` the Machine. See [Restart fallback](#restart-fallback). |
 | `--decisions` | `decisions` | empty | Entries replacing those of the [decision table](#decisions): comma-separated `ACTION=decision` pairs for the flag, a map of action to decision in the chart. |
+| `--device-quarantine` | `deviceQuarantine.enabled` | `false` | Carry out replace requests: quarantine the devices of the Machine's VM, then delete the Machine. See [Device quarantine](device-quarantine.md). |
+| `--quarantine-drivers` | `deviceQuarantine.drivers` | empty | The DRA drivers whose devices a replace request quarantines: comma-separated for the flag, a list in the chart. Required with `--device-quarantine`. |
 | `--leader-elect` | `leaderElect` | off (chart and manifests: on) | Hold a lease, so that only one replica acts. |
 | `--metrics-bind-address` | `metricsBindAddress` | `0` | Address of the metrics endpoint. `0` disables it. The chart adds no port or Service for it. |
 | `--health-probe-bind-address` | fixed to `:8081` | `:8081` | Address of `/healthz` and `/readyz`. |
@@ -52,7 +61,7 @@ The chart also has these values, which do not become flags:
 | `image.repository`, `image.tag`, `image.pullPolicy` | the release's image, `IfNotPresent` | The image. An empty tag means the chart's `appVersion`. |
 | `imagePullSecrets` | empty | Pull secrets for the image. |
 | `serviceAccount.create`, `.name`, `.annotations` | create, named after the release | The ServiceAccount the operator runs as. |
-| `rbac.create` | `true` | Create the ClusterRole, the leader election Role and their bindings. If `false`, bind the ServiceAccount yourself to roles with the rules in the chart's `files/manager-role-rules.yaml` (cluster-wide) and `files/leader-election-role-rules.yaml` (in the release namespace). |
+| `rbac.create` | `true` | Create the ClusterRole, the leader election Role and their bindings, and the device-quarantine ClusterRole when that is on. If `false`, bind the ServiceAccount yourself to roles with the rules in the chart's `files/manager-role-rules.yaml` (cluster-wide) and `files/leader-election-role-rules.yaml` (in the release namespace), and `files/device-quarantine-role-rules.yaml` (cluster-wide) for device quarantine. |
 | `resources` | 10m CPU, 64Mi memory; limit 256Mi memory | Memory grows with the number of workload clusters. Set a key to `null` to drop a default. |
 | `podAnnotations`, `podLabels`, `priorityClassName`, `nodeSelector`, `tolerations`, `affinity` | empty | Passed to the pod. |
 | `nameOverride`, `fullnameOverride` | empty | Names of the chart's objects. |
@@ -99,6 +108,8 @@ On a `Machine`:
 | `nvsentinel.petasus.io/remediation-request` | the operator | The `ExternalRemediationRequest` the restart was asked for. The restart answers that request and no other. |
 | `cluster.x-k8s.io/paused` | you or Cluster API | The Machine is not marked while it is paused, and is looked at again on the next poll. |
 | `cluster.x-k8s.io/skip-remediation` | you | The Machine is not marked while the annotation is there. |
+| `nvsentinel.petasus.io/replace` | you | A request to replace the Machine once its devices are quarantined: `quarantine`, or `quarantine:<device>[,<device>]`. Read only with [device quarantine](device-quarantine.md) on. |
+| `nvsentinel.petasus.io/replace-status` | the operator | How far the request got: `quarantining`, `replacing`, or `rejected: <reason>`. Remove it to try a rejected request again. |
 
 A mark the operator set before a Machine was paused or opted out is handled
 as usual: a restart mark is removed once the restart is over or its signal

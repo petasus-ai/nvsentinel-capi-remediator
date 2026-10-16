@@ -19,13 +19,17 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
@@ -40,6 +44,7 @@ import (
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/capi"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/controller"
 	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/decision"
+	"github.com/petasus-ai/nvsentinel-capi-remediator/internal/quarantine"
 )
 
 var (
@@ -54,14 +59,16 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr     string
-		probeAddr       string
-		clusterSelector string
-		restartFallback string
-		decisions       string
-		leaderElect     bool
-		dryRun          bool
-		pollInterval    time.Duration
+		metricsAddr       string
+		probeAddr         string
+		clusterSelector   string
+		restartFallback   string
+		decisions         string
+		quarantineDrivers string
+		leaderElect       bool
+		dryRun            bool
+		deviceQuarantine  bool
+		pollInterval      time.Duration
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0",
 		"The address the metrics endpoint binds to. 0 disables it.")
@@ -82,6 +89,13 @@ func main() {
 		"Entries replacing those of the built-in decision table, as comma-separated ACTION=decision pairs, "+
 			"e.g. COMPONENT_RESET=restart. An action is one NVSentinel recommends or the name of a custom one; "+
 			"a decision is report, restart or replace.")
+	flag.BoolVar(&deviceQuarantine, "device-quarantine", false,
+		"Carry out the "+quarantine.ReplaceAnnotation+" requests on Machines: quarantine the DRA devices of the Machine's VM "+
+			"with DeviceTaintRules, then delete the Machine for its MachineSet to replace. Needs KubeVirt Machines "+
+			"and DeviceTaintRules in the management cluster, and the permissions of the device-quarantine role.")
+	flag.StringVar(&quarantineDrivers, "quarantine-drivers", "",
+		"Comma-separated DRA drivers whose devices a replace request quarantines, e.g. gpu.nvidia.com. "+
+			"Required with --device-quarantine.")
 	zapOpts := zap.Options{}
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -119,6 +133,16 @@ func main() {
 		// leave the default in force without a word.
 		setupLog.Info("the decision table has entries for actions NVSentinel does not recommend itself; "+
 			"they apply to custom actions of exactly these names", "actions", custom)
+	}
+
+	var drivers sets.Set[string]
+	if deviceQuarantine {
+		if drivers, err = parseDrivers(quarantineDrivers); err != nil {
+			setupLog.Error(err, "invalid --quarantine-drivers")
+			os.Exit(1)
+		}
+	} else if quarantineDrivers != "" {
+		setupLog.Info("--quarantine-drivers is ignored without --device-quarantine")
 	}
 
 	cacheOpts := cache.Options{}
@@ -187,6 +211,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	if deviceQuarantine {
+		// The devices are found and the rules checked with uncached reads:
+		// a cache would hold every pod of the management cluster for the
+		// few a request reads, and the rules are read right after they are
+		// written.
+		q := &controller.MachineQuarantineReconciler{
+			Client:          mgr.GetClient(),
+			Locator:         &quarantine.KubeVirtLocator{Client: mgr.GetAPIReader(), Mapper: mgr.GetRESTMapper()},
+			Rules:           &quarantine.Rules{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Mapper: mgr.GetRESTMapper()},
+			Drivers:         drivers,
+			Recorder:        mgr.GetEventRecorder(controller.ControllerName),
+			DryRun:          dryRun,
+			ClusterSelector: selector,
+		}
+		// One request at a time: they are made by hand, and each takes
+		// seconds.
+		if err := q.SetupWithManager(mgr, ctrlcontroller.Options{MaxConcurrentReconciles: 1}); err != nil {
+			setupLog.Error(err, "unable to set up controller", "controller", controller.QuarantineControllerName)
+			os.Exit(1)
+		}
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -202,9 +248,33 @@ func main() {
 		"clusterSelector", clusterSelector,
 		"restartFallback", fallback,
 		"decisionTable", table.Entries(),
+		"deviceQuarantine", deviceQuarantine,
+		"quarantineDrivers", sets.List(drivers),
 	)
 	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "manager exited")
 		os.Exit(1)
 	}
+}
+
+// parseDrivers reads the comma-separated DRA driver names of
+// --quarantine-drivers. There has to be at least one, and each has to be a
+// valid driver name.
+func parseDrivers(s string) (sets.Set[string], error) {
+	drivers := sets.New[string]()
+	for name := range strings.SplitSeq(s, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			return nil, fmt.Errorf("driver %q: %s", name, strings.Join(errs, "; "))
+		}
+		drivers.Insert(name)
+	}
+	if drivers.Len() == 0 {
+		return nil, fmt.Errorf("--device-quarantine needs at least one driver")
+	}
+
+	return drivers, nil
 }

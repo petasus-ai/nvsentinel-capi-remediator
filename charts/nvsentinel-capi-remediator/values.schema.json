@@ -22,6 +22,21 @@
         "enum": ["report", "restart", "replace"]
       }
     },
+    "deviceQuarantine": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "drivers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+          }
+        }
+      }
+    },
     "pollInterval": {
       "type": "string"
     },

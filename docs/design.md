@@ -180,6 +180,78 @@ The operator reads each request again from the workload cluster's API server
 before it does anything about it, so a request answered a moment ago is
 never acted on twice.
 
+## Device quarantine
+
+[Device quarantine](device-quarantine.md) is a separate controller that
+watches Machines for the `nvsentinel.petasus.io/replace` request and nothing
+else. It does not share the polling of the signals: a request is made by hand
+and should be acted on at once, and its failures and retries have nothing to
+do with those of a cluster's signals.
+
+**Why `DeviceTaintRule`.** A rule is the standard way for an administrator to
+taint a DRA device: the scheduler honours it whatever driver publishes the
+device, so no driver has to take part, and it is an ordinary object that
+`kubectl` lists and deletes. The rules are written as unstructured objects,
+in `v1` where the cluster serves it and else in `v1beta2`: the module's
+Kubernetes API types have no `v1` of them yet, and typed `v1beta2` alone
+would break once that version is gone. The few fields written are the same
+in both.
+
+**One rule per device, named after it.** The name is derived from the
+driver, pool and device, so a device is never tainted twice by the operator
+and a request carried out again, after a restart of the operator for
+instance, creates nothing new. The rule has no owner, because the device has
+to stay out of scheduling after the Machine is gone, until someone repairs it
+and deletes the rule. Hardware does not heal on its own, so nothing deletes
+rules automatically.
+
+**`NoSchedule`, not `NoExecute`.** The rule only keeps the device from being
+allocated again; it evicts nobody. The Machine's own deletion drains the
+node.
+
+**The rules first, then the deletion.** The Machine is deleted only once
+every rule has been read back. The rules do not show in the ResourceSlices,
+so there is nothing else to wait for: the scheduler applies a rule as soon as
+it sees it. The deletion carries the Machine's UID as a precondition, so a
+Machine of the same name made since is never deleted in its place. Deleting
+the Machine, rather than marking it, replaces it whether or not a
+MachineHealthCheck selects it; a MachineSet has to own it, or nothing would
+replace it.
+
+**Which devices.** The operator follows the Machine to its
+`KubevirtMachine`, the VM's `VirtualMachineInstance`, its virt-launcher pods
+and their ResourceClaims, and keeps the devices of the configured drivers.
+Driver names are the one standard field that tells devices apart in every
+cluster; there is no standard way to tell a GPU from other devices by their
+attributes, and one driver may publish several kinds. When more than one
+device is left, the request has to name them: a device's name alone, which
+is unique among the devices of one VM in practice, and is rejected rather
+than guessed at when it is not.
+
+**The devices of the running VM.** A VM that restarts is given its devices
+anew, through a new virt-launcher pod and new claims, and may come back with
+other devices than the faulty ones. So the devices are taken from a VM that
+is running and not being deleted, a Machine marked for remediation, whose
+VM may be restarting or about to, is rejected, and a request found
+`replacing` after an interruption is not looked up again but goes straight
+on to the deletion: the rules it needs are all in place.
+
+**Guards and changes.** The guards of a mark apply, the mark itself
+included. A rejection is final until the status is removed, so that a
+Machine is never replaced at some later time nobody chose, once its Cluster
+is unpaused for instance. Every write is conditional on the Machine being as
+it was read: the status patches carry its resourceVersion, and the deletion
+the resourceVersion of the last patch as well as the UID. A request edited
+or withdrawn while it is carried out, or a Machine paused meanwhile, makes
+the next write fail, and the request is evaluated again from the start. The
+same keeps a cache that lags behind the last patch from acting a second
+time.
+
+**What cannot be checked.** On Kubernetes 1.36 the rules have effect only
+if kube-scheduler runs with the `DRADeviceTaintRules` gate. Nothing in the
+API shows whether it does, so the operator trusts the rule once it is
+served.
+
 ## Provider neutrality
 
 The operator imports Cluster API core only, and both of its actions are
@@ -189,3 +261,9 @@ MachineHealthCheck and MachineSet controllers, and a restart is the external
 remediation template contract behind a MachineHealthCheck's `templateRef`.
 What a provider has to offer for restarts is described in
 [machinehealthchecks.md](machinehealthchecks.md#what-a-remediation-template-has-to-do).
+
+Device quarantine is the one feature tied to a provider. Finding the devices
+of a Machine depends on how the provider runs it; that is kept behind one
+interface, implemented for Cluster API Provider KubeVirt, and read without
+importing KubeVirt or the provider. The rules themselves are plain
+Kubernetes.

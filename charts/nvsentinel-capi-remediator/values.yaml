@@ -37,6 +37,19 @@ restartFallback: report
 #     COMPONENT_RESET: restart
 decisions: {}
 
+# Replace requests: a Machine annotated nvsentinel.petasus.io/replace=quarantine
+# has the DRA devices of its VM quarantined with DeviceTaintRules and is then
+# deleted for its MachineSet to replace. Off by default; turning it on adds a
+# ClusterRole that may delete Machines and create DeviceTaintRules. It needs
+# KubeVirt Machines, and DeviceTaintRules served by the management cluster:
+# Kubernetes 1.37 serves them by default, 1.36 only with the
+# DRADeviceTaintRules feature gate and the resource.k8s.io/v1beta2 API on.
+deviceQuarantine:
+  enabled: false
+  # The DRA drivers whose devices a request quarantines, e.g. gpu.nvidia.com.
+  # Required when enabled.
+  drivers: []
+
 # The single replica holds a lease, so that during a rollout the new pod
 # waits for the old one to let go of it.
 leaderElect: true
@@ -57,7 +70,8 @@ serviceAccount:
   annotations: {}
 
 rbac:
-  # Create the ClusterRole, the leader election Role and their bindings.
+  # Create the ClusterRole, the leader election Role and their bindings, and
+  # the device quarantine ClusterRole and its binding when that is enabled.
   create: true
 
 # Memory grows with the number of workload clusters, each of which keeps a

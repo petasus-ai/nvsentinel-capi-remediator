@@ -1,6 +1,11 @@
 {{- if not (has .Values.restartFallback (list "report" "replace")) }}
 {{- fail (printf "restartFallback must be \"report\" or \"replace\", got %q" (toString .Values.restartFallback)) }}
 {{- end }}
+{{- /* Values reused from a release of an earlier chart have no deviceQuarantine. */}}
+{{- $quarantine := .Values.deviceQuarantine | default dict }}
+{{- if and $quarantine.enabled (empty $quarantine.drivers) }}
+{{- fail "deviceQuarantine.drivers must list at least one DRA driver when deviceQuarantine.enabled is true" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -65,6 +70,10 @@ spec:
         {{- $entries = append $entries (printf "%s=%s" $action $decision) }}
         {{- end }}
         - {{ printf "--decisions=%s" (join "," $entries) | quote }}
+        {{- end }}
+        {{- if $quarantine.enabled }}
+        - --device-quarantine
+        - {{ printf "--quarantine-drivers=%s" (join "," $quarantine.drivers) | quote }}
         {{- end }}
         {{- range .Values.extraArgs }}
         - {{ . | quote }}
