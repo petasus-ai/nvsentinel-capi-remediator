@@ -35,7 +35,7 @@ See [its permissions](device-quarantine.md#permissions).
 | Flag | Chart value | Default | Meaning |
 |---|---|---|---|
 | `--dry-run` | `dryRun` | `true` | Log every decision and write nothing: no Machine is marked, no request answered, no Event recorded. |
-| `--poll-interval` | `pollInterval` | `2m` | How often each workload cluster's signals are read. Requests are the exception: the operator watches them and reads each one as soon as NVSentinel releases its node. Everything else, including the end of a restart, is noticed at the next poll. |
+| `--poll-interval` | `pollInterval` | `2m` | How often each workload cluster's signals are read. Requests are the exception: the operator watches them and reads each one as soon as NVSentinel releases its node. Everything else, including the end of a restart, is noticed at the next poll. A duration such as `30s` or `1m30s`; the chart refuses anything else. |
 | `--cluster-selector` | `clusterSelector` | empty | Label selector for the Clusters to watch, for example `environment=gpu`. Empty selects every Cluster. Clusters it does not select are never connected to. |
 | `--restart-fallback` | `restartFallback` | `report` | What to do with a restart no remediation template can carry out: `report` it, or `replace` the Machine. See [Restart fallback](#restart-fallback). |
 | `--decisions` | `decisions` | empty | Entries replacing those of the [decision table](#decisions): comma-separated `ACTION=decision` pairs for the flag, a map of action to decision in the chart. |

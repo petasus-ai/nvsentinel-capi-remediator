@@ -217,6 +217,12 @@ verify-chart:
 	  echo "$(CHART) rendered an unknown restartFallback"; exit 1; \
 	elif ! printf '%s\n' "$$out" | grep -q 'restartFallback'; then \
 	  echo "$(CHART) failed on an unknown restartFallback without naming it:"; printf '%s\n' "$$out"; exit 1; fi
+	@if out="$$($(HELM) template remediator $(CHART) --set pollInterval=2min 2>&1)"; then \
+	  echo "$(CHART) rendered a pollInterval that is not a duration"; exit 1; \
+	elif ! printf '%s\n' "$$out" | grep -q 'pollInterval'; then \
+	  echo "$(CHART) failed on a pollInterval that is not a duration without naming it:"; printf '%s\n' "$$out"; exit 1; fi
+	@$(HELM) template remediator $(CHART) --set pollInterval=1m30s | grep -q -- '- "--poll-interval=1m30s"' || \
+	  { echo "$(CHART) did not render a pollInterval of two units"; exit 1; }
 	@if out="$$($(HELM) template remediator $(CHART) --set decisions.COMPONENT_RESET=reboot 2>&1)"; then \
 	  echo "$(CHART) rendered an unknown decision"; exit 1; \
 	elif ! printf '%s\n' "$$out" | grep -q 'decisions'; then \

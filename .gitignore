@@ -1,4 +1,5 @@
 bin/
+/manager
 dist/
 *.test
 *.out
