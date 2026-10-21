@@ -30,7 +30,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 # already runs as its nonroot user; the USER line keeps that true should
 # the base change. The source label lets a registry link the image to the
 # repository.
-FROM gcr.io/distroless/static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+FROM gcr.io/distroless/static:nonroot@sha256:516757106de35205efb70b91ba03f6f1298424a0678c603255cf2852a7000087
 LABEL org.opencontainers.image.source="https://github.com/petasus-ai/nvsentinel-capi-remediator" \
       org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /
