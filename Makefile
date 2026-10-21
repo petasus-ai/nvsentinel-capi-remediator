@@ -163,8 +163,9 @@ verify-kustomize:
 # earlier chart, which must render the same; with device quarantine on,
 # which must add its arguments, ClusterRole and binding; with the settings
 # that become arguments; and with device quarantine but no drivers, a
-# restart fallback and a decision the manager would reject, each of which
-# the chart must refuse by name. It is then
+# restart fallback, a decision, a poll interval or a metrics address the
+# manager would reject, or a value it renders unconditionally removed, each
+# of which the chart must refuse by name. It is then
 # packaged the way a release packages it, which must make the release's
 # image the default.
 verify-chart:
@@ -217,12 +218,24 @@ verify-chart:
 	  echo "$(CHART) rendered an unknown restartFallback"; exit 1; \
 	elif ! printf '%s\n' "$$out" | grep -q 'restartFallback'; then \
 	  echo "$(CHART) failed on an unknown restartFallback without naming it:"; printf '%s\n' "$$out"; exit 1; fi
-	@if out="$$($(HELM) template remediator $(CHART) --set pollInterval=2min 2>&1)"; then \
-	  echo "$(CHART) rendered a pollInterval that is not a duration"; exit 1; \
-	elif ! printf '%s\n' "$$out" | grep -q 'pollInterval'; then \
-	  echo "$(CHART) failed on a pollInterval that is not a duration without naming it:"; printf '%s\n' "$$out"; exit 1; fi
-	@$(HELM) template remediator $(CHART) --set pollInterval=1m30s | grep -q -- '- "--poll-interval=1m30s"' || \
+	@for bad in 2min 2562048h 30s1m; do \
+	  if out="$$($(HELM) template remediator $(CHART) --set pollInterval=$$bad 2>&1)"; then \
+	    echo "$(CHART) rendered the pollInterval $$bad"; exit 1; \
+	  elif ! printf '%s\n' "$$out" | grep -q 'pollInterval'; then \
+	    echo "$(CHART) failed on the pollInterval $$bad without naming it:"; printf '%s\n' "$$out"; exit 1; fi; \
+	done
+	@$(HELM) template remediator $(CHART) --set pollInterval=1h30m | grep -q -- '- "--poll-interval=1h30m"' || \
 	  { echo "$(CHART) did not render a pollInterval of two units"; exit 1; }
+	@if out="$$($(HELM) template remediator $(CHART) --set metricsBindAddress=8080 2>&1)"; then \
+	  echo "$(CHART) rendered a metricsBindAddress that is a port alone"; exit 1; \
+	elif ! printf '%s\n' "$$out" | grep -q 'metricsBindAddress'; then \
+	  echo "$(CHART) failed on a metricsBindAddress that is a port alone without naming it:"; printf '%s\n' "$$out"; exit 1; fi
+	@for key in dryRun pollInterval restartFallback metricsBindAddress image.repository; do \
+	  if out="$$($(HELM) template remediator $(CHART) --set $$key=null 2>&1)"; then \
+	    echo "$(CHART) rendered without $$key"; exit 1; \
+	  elif ! printf '%s\n' "$$out" | grep -q "$${key#image.}"; then \
+	    echo "$(CHART) failed without $$key without naming it:"; printf '%s\n' "$$out"; exit 1; fi; \
+	done
 	@if out="$$($(HELM) template remediator $(CHART) --set decisions.COMPONENT_RESET=reboot 2>&1)"; then \
 	  echo "$(CHART) rendered an unknown decision"; exit 1; \
 	elif ! printf '%s\n' "$$out" | grep -q 'decisions'; then \

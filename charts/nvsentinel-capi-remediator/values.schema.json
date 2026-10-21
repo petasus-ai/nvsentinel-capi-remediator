@@ -1,7 +1,22 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
+  "required": ["image", "dryRun", "pollInterval", "restartFallback", "metricsBindAddress"],
   "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "metricsBindAddress": {
+      "description": "An address such as :8080, or 0 to turn the endpoint off.",
+      "anyOf": [{"type": "string"}, {"const": 0}]
+    },
     "dryRun": {
       "type": "boolean"
     },
@@ -32,14 +47,17 @@
           "type": "array",
           "items": {
             "type": "string",
+            "maxLength": 253,
             "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
           }
         }
       }
     },
     "pollInterval": {
+      "description": "A Go duration, larger units first and each at most once, small enough to count in nanoseconds.",
       "type": "string",
-      "pattern": "^(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|\u00b5s|\u03bcs|ms|s|m|h))+$"
+      "minLength": 2,
+      "pattern": "^((\\d{1,6}(\\.\\d*)?|\\.\\d+)h)?((\\d{1,7}(\\.\\d*)?|\\.\\d+)m)?((\\d{1,9}(\\.\\d*)?|\\.\\d+)s)?((\\d{1,9}(\\.\\d*)?|\\.\\d+)ms)?((\\d{1,9}(\\.\\d*)?|\\.\\d+)(us|\u00b5s|\u03bcs))?((\\d{1,9}(\\.\\d*)?|\\.\\d+)ns)?$"
     },
     "clusterSelector": {
       "type": "string"

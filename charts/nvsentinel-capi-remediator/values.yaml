@@ -18,7 +18,7 @@ dryRun: true
 # How often each workload cluster's signals are read. A request is read as
 # soon as NVSentinel releases its node, without waiting for a poll;
 # everything else is noticed at one, including that a restart has completed.
-# A duration such as 30s or 1m30s.
+# A duration such as 30s or 1h30m, larger units first and each at most once.
 pollInterval: 2m
 
 # Label selector limiting which Clusters are watched, e.g. "environment=gpu".
