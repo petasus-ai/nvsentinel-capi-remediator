@@ -1,0 +1,31 @@
+name: Chart (dev channel)
+
+# Publishes the chart to the dev channel of petasus-ai/edgestack-helm (0.0.0-dev) when a
+# push to main changes it, with the shared action of petasus-ai/.github, so edgespray's
+# dev branch runs the chart of main with the :dev image. Releases still publish their
+# own version from release.yml.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'charts/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chart-dev
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Publish 0.0.0-dev to the dev channel
+        uses: petasus-ai/.github/actions/publish-chart@f66755de01cb62bb6f294e1f0303e54b45c323df
+        with:
+          chart: charts/nvsentinel-capi-remediator
+          channel: dev
+          token: ${{ secrets.MY_TOKEN }}
