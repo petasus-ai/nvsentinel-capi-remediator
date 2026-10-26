@@ -193,7 +193,8 @@ jobs:
             *": not found"* | *"401 Unauthorized"*) ;;
             *) printf '%s\n' "$out"; exit 1 ;;
           esac
-          make docker-buildx IMG="$IMAGE:$GITHUB_REF_NAME"
+          # The revision label tells which commit the release was built from.
+          make docker-buildx IMG="$IMAGE:$GITHUB_REF_NAME" REVISION="$GITHUB_SHA"
 
       # The chart names this image and its users pull it without
       # credentials, which a repository the first push created may not
