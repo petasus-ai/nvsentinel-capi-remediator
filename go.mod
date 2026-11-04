@@ -4,8 +4,8 @@ go 1.26.0
 
 require (
 	github.com/go-logr/logr v1.4.4
-	k8s.io/api v0.36.5
-	k8s.io/apimachinery v0.36.5
+	k8s.io/api v0.36.6
+	k8s.io/apimachinery v0.36.6
 	k8s.io/client-go v0.36.5
 	sigs.k8s.io/cluster-api v1.14.3
 	sigs.k8s.io/cluster-api/api v1.14.3
