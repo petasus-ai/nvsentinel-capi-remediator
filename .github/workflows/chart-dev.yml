@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Publish 0.0.0-dev to the dev channel
-        uses: petasus-ai/.github/actions/publish-chart@f66755de01cb62bb6f294e1f0303e54b45c323df
+        uses: petasus-ai/.github/actions/publish-chart@221a13962bd7bffe6ded66edff47b983de852c47
         with:
           chart: charts/nvsentinel-capi-remediator
           channel: dev
