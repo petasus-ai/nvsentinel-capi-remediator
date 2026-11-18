@@ -45,8 +45,8 @@ How each NVSentinel deployment is read, by version:
 
 The operator tells these apart by the resources a cluster serves; see
 [configuration.md](configuration.md#signal-source). The values below were
-written for NVSentinel's chart v1.26.0; check the keys against the chart of
-your version.
+written for NVSentinel's chart v1.32.0 and read the same for v1.26.0; check
+the keys against the chart of your version.
 
 ## Routing actions to requests
 
@@ -54,14 +54,14 @@ your version.
 > Once actions are routed to requests, NVSentinel cordons, drains and
 > releases a node before the operator sees it. An operator in dry-run mode
 > does not answer, so the node stays released until the request is deleted
-> or its TTL passes. Route actions to requests only where the operator
-> already remediates.
+> (before NVSentinel v1.31, also until its TTL passes). Route actions to
+> requests only where the operator already remediates.
 
 With the remediation pipeline, NVSentinel cordons and drains a faulty node
 and then creates the maintenance object configured for the recommended
 action. To hand an action to this operator, route it to
 `ExternalRemediationRequest`. The excerpt below of the values for
-NVSentinel's Helm chart (v1.26.0) does that. NVSentinel's own prerequisites,
+NVSentinel's Helm chart (v1.32.0) does that. NVSentinel's own prerequisites,
 such as cert-manager, still apply.
 
 ```yaml
@@ -147,9 +147,12 @@ Notes on that configuration:
 
   Otherwise the janitor pod waits for a certificate that nothing issues. The
   controller that handles requests needs none of these.
-- **Requests are deleted after the TTL** in the annotation, 14 days here,
-  whether or not they were answered. Deleting a request hands its node back
-  to NVSentinel, so that is also how long a node nobody remediates stays
+- **Requests are deleted after the TTL** in the annotation, 14 days here.
+  From NVSentinel v1.31 the TTL starts when a request completes, that is
+  once it is answered `True`: a request answered `False`, or not at all, is
+  never deleted by it, and keeps its node released until you delete it.
+  Before v1.31 the TTL started when the request was made, whether or not it
+  was answered, so it was also how long a node nobody remediates stayed
   released.
 - **A fault that outlasts its remediation gets a new request.** Once a
   request is answered `True` the monitors return, report what they still
@@ -176,9 +179,9 @@ that GPU in a Job on the node, and puts the services back. It needs no CSP
 provider, and it has been seen to work on a GPU passed through to a KubeVirt
 virtual machine. The operator has no part in it, except when a reset fails:
 NVSentinel then reports a fault that asks for a restart, which goes to a
-request like any other. For chart v1.26.0, merge the following into the
-values above; its `COMPONENT_RESET` entry replaces the `null` under the same
-`actions` key:
+request like any other. For chart v1.32.0 (v1.26.0 alike), merge the
+following into the values above; its `COMPONENT_RESET` entry replaces the
+`null` under the same `actions` key:
 
 ```yaml
 fault-remediation:
@@ -235,13 +238,17 @@ janitor:
   without `enabledValue` and `disabledValue` the node's
   `nvidia.com/gpu.deploy.*` labels are emptied for the reset and never set
   back, and the services stay off the node.
-- **Which services run.** The janitor considers a reset done only once every
-  service in the description has a ready pod on the node again. The built-in
-  description lists the device plugin, so on a cluster whose GPUs a DRA
-  (Dynamic Resource Allocation) driver hands out, where the GPU operator runs
-  no device plugin, a reset that worked ends with `RestoreTimeoutExceeded`
-  ten minutes later. List the services that do run: DCGM, the DCGM exporter
-  and GPU feature discovery.
+- **Which services run.** Before NVSentinel v1.27 the janitor considers a
+  reset done only once every service in the description has a ready pod on
+  the node again. The built-in description lists the device plugin, so on a
+  cluster whose GPUs a DRA (Dynamic Resource Allocation) driver hands out,
+  where the GPU operator runs no device plugin, a reset that worked ends with
+  `RestoreTimeoutExceeded` ten minutes later. From v1.27 it records in the
+  GPUReset's `status.managedServices` the services that had a pod on the node
+  when it took them off, and waits for those only; that field is in the
+  GPUReset CRD of v1.27 and later, which Helm does not upgrade, so apply the
+  new CRD before upgrading from an earlier chart. Either way, list the
+  services that do run: DCGM, the DCGM exporter and GPU feature discovery.
 - **DCGM is away during a reset.** The GPU health monitor reports the first
   failed poll of DCGM as a fault of its own, which can quarantine the node
   again after a reset. The debounce above makes that four polls in a row.
@@ -306,6 +313,7 @@ decisions:
    goes with the node.
 
 An answer of `False`, and a request nobody answers, leave the node released
-until the request is deleted, by you or by its TTL. See
+until the request is deleted: by you, or, before NVSentinel v1.31, by its
+TTL. See
 [operations.md](operations.md#how-requests-are-answered) for what the
 operator answers and how to take such a node back.

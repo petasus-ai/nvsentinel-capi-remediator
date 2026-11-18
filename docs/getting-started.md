@@ -232,9 +232,10 @@ explains the Events, the answers to requests, and how to undo a mark.
 Where NVSentinel hands nodes over through `ExternalRemediationRequest`, it
 cordons and drains a node, creates the request, and then releases the node
 to it. In dry-run mode the operator does not answer, so the node stays
-released until the request is deleted or its TTL passes, 14 days in the
-example configuration. Hand actions over through requests only on a cluster
-where the operator already remediates:
+released until the request is deleted: from NVSentinel v1.31 a request's TTL
+starts only when the request completes, and before v1.31 it ended 14 days
+after the request was made in the example configuration. Hand actions over
+through requests only on a cluster where the operator already remediates:
 
 1. Run the dry run while NVSentinel only detects faults (`NodeCondition` mode).
 2. Prepare the MachineHealthChecks.

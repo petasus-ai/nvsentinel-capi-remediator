@@ -95,10 +95,11 @@ operator's answer in the request's `ExternalRemediationComplete` condition.
 
 NVSentinel does not take the node back on `False`: the node stays cordoned
 and released, on the grounds that an external system that gave up may have
-left it in any state. It stays released until the request is deleted, which
-NVSentinel does itself once the request's TTL has passed. To hand such a
-node back sooner, once you have looked at it, delete the request in the
-workload cluster:
+left it in any state. It stays released until the request is deleted.
+NVSentinel before v1.31 does that itself once the request's TTL has passed;
+from v1.31 the TTL starts only when a request completes `True`, so a request
+answered `False` stays until you delete it. To hand such a node back sooner,
+once you have looked at it, delete the request in the workload cluster:
 
 ```sh
 kubectl delete externalremediationrequest <name>
@@ -181,7 +182,8 @@ and recorded once more.
 ## Uninstalling
 
 1. Where NVSentinel routes actions to requests, stop routing them first.
-   Requests nobody answers keep their nodes released until their TTL.
+   Requests nobody answers keep their nodes released until they are
+   deleted (before NVSentinel v1.31, until their TTL).
 2. Uninstall:
 
    ```sh
