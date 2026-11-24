@@ -158,7 +158,12 @@ decisions:
 - **Custom actions.** Only an `ExternalRemediationRequest` carries a custom
   action's name. A node condition shows every custom action as `CUSTOM`, and
   in a request the `CUSTOM` entry applies only when the request does not name
-  the custom action.
+  the custom action. From NVSentinel v1.33 a health event override can send
+  any fault to a custom action, with `recommendedAction: "CUSTOM"` and
+  `customRecommendedAction` set to its name. Route that name to a request in
+  fault-remediation's `maintenance.actions`
+  ([nvsentinel.md](nvsentinel.md#routing-actions-to-requests)) and give it
+  an entry here.
 - **Which signals an entry affects.** An entry matters only for signals the
   operator acts on; see [Signal source](#signal-source). In
   `ExternalRemediationRequest` mode the operator sees only the actions

@@ -45,8 +45,9 @@ How each NVSentinel deployment is read, by version:
 
 The operator tells these apart by the resources a cluster serves; see
 [configuration.md](configuration.md#signal-source). The values below were
-written for NVSentinel's chart v1.32.0 and read the same for v1.26.0; check
-the keys against the chart of your version.
+written for NVSentinel's chart v1.33.0 and read the same from v1.26.0, except
+for the condition that marks [a GPU reset](#a-gpu-reset) done; check the keys
+against the chart of your version.
 
 ## Routing actions to requests
 
@@ -61,7 +62,7 @@ With the remediation pipeline, NVSentinel cordons and drains a faulty node
 and then creates the maintenance object configured for the recommended
 action. To hand an action to this operator, route it to
 `ExternalRemediationRequest`. The excerpt below of the values for
-NVSentinel's Helm chart (v1.32.0) does that. NVSentinel's own prerequisites,
+NVSentinel's Helm chart (v1.33.0) does that. NVSentinel's own prerequisites,
 such as cert-manager, still apply.
 
 ```yaml
@@ -124,7 +125,8 @@ Notes on that configuration:
 - **One equivalence group for all three actions.** NVSentinel's janitor
   taints a released node with a taint that is unique per node, so a node can
   have one open request at a time. A shared group keeps fault-remediation from
-  creating a second one while the first is open.
+  creating a second one while the first is open. A custom action routed to
+  a request takes the same entry, and so the same group.
 - **The template is a Go template that fault-remediation renders.** If the
   values pass through another templating step first, as with Cluster API's
   Helm add-on provider, its `{{ }}` have to be escaped for that step.
@@ -164,7 +166,20 @@ Notes on that configuration:
   operator declined counts as an attempt, and so does one that could not be
   created. The actions that share an equivalence group share the count, so
   with `maxRemediationAttempts: 1` a replacement asked for after a restart
-  would also be refused.
+  would also be refused. Before v1.33 the syslog health monitor read a
+  restarted node's journal only from the moment it came back, so an XID
+  logged earlier in that boot went unseen; from v1.33 it reads that boot
+  from its start, within `bootLookbackWindow` (2 hours by default).
+- **A replacement and the circuit breaker.** fault-quarantine's circuit
+  breaker counts cordons within a window, 5 minutes by default, and a node
+  that a replacement deletes counts until its cordon leaves the window. With
+  no GPU node counted, any cordon in the window trips the breaker. So before
+  v1.33, a replacement that deleted a cluster's last GPU node within the
+  window of its cordon tripped it, and NVSentinel then quarantined and
+  released no node until someone reset the breaker. From v1.33 the cordons
+  of deleted nodes stop counting in that case. On an earlier version, turn
+  the breaker off (`fault-quarantine.circuitBreaker.enabled: false`) on a
+  cluster with one GPU node.
 
 ## A GPU reset
 
@@ -179,9 +194,11 @@ that GPU in a Job on the node, and puts the services back. It needs no CSP
 provider, and it has been seen to work on a GPU passed through to a KubeVirt
 virtual machine. The operator has no part in it, except when a reset fails:
 NVSentinel then reports a fault that asks for a restart, which goes to a
-request like any other. For chart v1.32.0 (v1.26.0 alike), merge the
-following into the values above; its `COMPONENT_RESET` entry replaces the
-`null` under the same `actions` key:
+request like any other. For chart v1.33.0, merge the following into the
+values above; its `COMPONENT_RESET` entry replaces the `null` under the same
+`actions` key. For a chart from v1.26.0 to v1.32.0, set
+`completeConditionType` to `Complete` instead (see
+[which condition marks a reset done](#what-to-check-before-relying-on-it)):
 
 ```yaml
 fault-remediation:
@@ -192,7 +209,8 @@ fault-remediation:
         version: v1alpha1
         kind: GPUReset
         scope: Cluster
-        completeConditionType: Complete
+        # Complete before v1.33.0.
+        completeConditionType: Succeeded
         templateFileName: gpureset.yaml
         equivalenceGroup: gpu-reset
         impactedEntityScope: GPU_UUID
@@ -229,6 +247,17 @@ janitor:
 
 #### What to check before relying on it
 
+- **Which condition marks a reset done.** The janitor sets `Complete` to
+  `True` on every GPUReset that ends, also on one that failed, so
+  fault-remediation reading `Complete` counts a failed reset as a
+  remediation. From v1.33.0 the janitor also sets `Succeeded`: `True`, or
+  `False` with the failure reason. It adds the condition to the GPUResets
+  that ended before the upgrade too. With `Succeeded`, an event that
+  fault-remediation handles after a failed reset gets a new reset. Use
+  `Succeeded` only with a janitor of v1.33.0 or later: an earlier one never
+  sets it, so every GPUReset reads as still running and its GPU gets no new
+  reset. Helm keeps a value you set, so change it in the same upgrade as the
+  chart.
 - **Where the GPU operator runs.** The janitor's built-in description of it
   looks in the `gpu-operator` namespace. Anywhere else, give
   `janitor.config.controllers.gpuReset.serviceManager.spec` in full:
@@ -259,9 +288,10 @@ janitor:
   `/run/nvidia/driver` (for a driver installed on the host see
   `janitor.config.controllers.gpuReset.resetJob.hostDriverRootPath`), and pulls
   `ghcr.io/nvidia/nvsentinel/gpu-reset` on every reset. Where one of these
-  does not hold, the Job ends before it reports anything, fault-remediation
-  reads the `GPUReset` as done either way, and the node stays cordoned with
-  nothing acting on it.
+  does not hold, the Job ends before it reports anything, so no fault asks
+  for a restart, and the node stays cordoned with nothing acting on it.
+  `Succeeded` does not change that: fault-remediation reads the condition
+  only when it handles an event, and none comes.
 - **Which pods are drained.** With `partialDrainEnabled`, only the pods that
   use the GPU are drained. NVSentinel identifies them from an annotation its
   metadata collector keeps on each pod, based on the kubelet's pod
